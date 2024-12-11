@@ -1,0 +1,1036 @@
+---
+title: "Heras-Murillo et al. Mouse scRNAseq"
+author: "Ignacio Heras-Murillo"
+documentclass: article
+output:
+  html_document: 
+    number_sections: yes
+    self_contained: no
+    theme: united
+    toc: yes
+    toc_depth: 5  
+    toc_float: true
+    collapsed: no
+  pdf_document:
+    fig_caption: yes
+    keep_tex: yes
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+urlcolor: blue
+classoption: a4paper
+---
+
+#Load packages
+```{r setup, include=FALSE}
+## packages
+suppressMessages(library("Matrix"))
+suppressMessages(library("ggplot2"))
+suppressMessages(library("ggrepel"))
+suppressMessages(library("ggpubr"))
+suppressMessages(library("ggridges"))
+suppressMessages(library("dplyr"))
+suppressMessages(library("tidyr"))
+suppressMessages(library("readr"))
+suppressMessages(library("biomaRt"))
+suppressMessages(library("Seurat"))
+suppressMessages(library("scater"))
+suppressMessages(library("org.Mm.eg.db"))
+suppressMessages(library("ggvenn"))
+suppressMessages(library("gtools"))
+suppressMessages(library("viridis"))
+suppressMessages(library("plotly"))
+suppressMessages(library("Matrix.utils"))
+suppressMessages(library("tibble"))
+suppressMessages(library("ggpointdensity"))
+suppressMessages(library("melt"))
+suppressMessages(library("reshape2"))
+suppressMessages(library("circlize"))
+suppressMessages(library("KEGGREST"))
+suppressMessages(library("EnrichmentBrowser"))
+suppressMessages(library("fgsea"))
+suppressMessages(library("reshape2"))
+
+## paths
+projectPath <- here::here()
+dataPath <- here::here("data")
+dataChip1Path <- here::here("data/Chip1-Data")
+dataChip2Path <- here::here("data/Chip2-Data")
+metadataPath <- here::here("metadata")
+sourceCode <- here::here("src")
+objectsPath <- here::here("HW-Fig6")
+processedPath <- here::here("HW-Fig6/processed_data")
+reportsPath <- here::here("reports/HW-Fig6")
+plotsPath <- here::here(reportsPath, "plots")
+prefix <- "HW-Fig6"
+
+## scr code
+source(file.path(sourceCode, "helperFunctions.R"))
+
+## rmarkdown settings
+knitr::opts_chunk$set(
+  echo = FALSE,
+  fig.align = "center",
+  fig.path = file.path(reportsPath, "plots/"),
+  fig.pos = "H",
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  dev = "png",
+  dpi = 300
+)
+
+## global options
+options(encoding = 'UTF-8')
+```
+
+```{r}
+## just in case
+if (!file.exists(reportsPath)) {
+  dir.create(reportsPath)
+  dir.create(file.path(reportsPath, "plots"))
+}
+```
+
+```{r}
+if (file.exists(file.path(
+  objectsPath, paste(prefix, "bmAnnotations.rds", sep = ".")
+))) {
+  message(paste("Load bmAnnotations from file:", file.path(
+    objectsPath, paste(prefix, "bmAnnotations.rds", sep = ".")
+  )))
+  bmAnnotations <- readRDS(file = file.path(
+    objectsPath, paste(prefix, "bmAnnotations.rds", sep = ".")
+  ))
+  MTGenes <- readRDS(file = file.path(
+    objectsPath, paste(prefix, "mtGenes.rds", sep = ".")
+  ))
+  RBGenes1 <- readRDS(file = file.path(
+    objectsPath, paste(prefix, "rbGenes.1.rds", sep = ".")
+  ))
+  RBGenes2 <- readRDS(file = file.path(
+    objectsPath, paste(prefix, "rbGenes.2.rds", sep = ".")
+  ))
+} else {
+  ensembl <- useEnsembl(biomart = "genes")
+  ensembl <- useDataset(dataset = "mmusculus_gene_ensembl", mart = ensembl)
+  
+  bmAnnotations <- getBM(
+    attributes = c(
+      "external_gene_name", "entrezgene_id",
+      "entrezgene_trans_name", "entrezgene_accession",
+      "ensembl_gene_id", "gene_biotype", 
+      "chromosome_name", "start_position", 
+      "end_position", "strand", 
+      "description"
+    ), uniqueRows = T, mart = ensembl
+  )
+  # bmAnnotations <- bmAnnotations %>% filter(!grepl("^CHR_", chromosome_name))
+  bmAnnotations$external_gene_name <- toupper(bmAnnotations$external_gene_name)
+  ## Mitochondrial genes
+  MTGenes <- bmAnnotations[bmAnnotations$chromosome_name == "MT",]
+  RBGenes1 <- bmAnnotations %>% filter(gene_biotype == "rRNA")
+  RBGenes2 <- read.delim(
+    file.path(metadataPath, "AllRibosomalProteins.csv"),
+    sep = "\t", stringsAsFactors = F, header = T
+  )
+  saveRDS(MTGenes, file = file.path(
+    objectsPath, paste(prefix, "mtGenes.rds", sep = ".")
+  ))
+  saveRDS(RBGenes1, file = file.path(
+    objectsPath, paste(prefix, "rbGenes.1.rds", sep = ".")
+  ))
+  saveRDS(RBGenes2, file = file.path(
+    objectsPath, paste(prefix, "rbGenes.2.rds", sep = ".")
+  ))
+  saveRDS(bmAnnotations, file = file.path(
+    objectsPath, paste(prefix, "bmAnnotations.rds", sep = ".")
+  ))
+}
+```
+
+# Load data
+
+```{r}
+seuratSC.Raw.1 <- readRDS(
+  file = file.path(objectsPath, paste(prefix, "seuratSC.CMO.Norm.1.rds", sep = "."))
+)
+seuratSC.Raw.2 <- readRDS(
+  file = file.path(objectsPath, paste(prefix, "seuratSC.CMO.Norm.2.rds", sep = "."))
+)
+```
+
+Merge reads from both sequencing lines.
+```{r}
+seuratSC.Raw.comb <- merge(
+  x = seuratSC.Raw.1, y = seuratSC.Raw.2, 
+  add.cell.ids = NULL, project = "TILs-CancerVacc"
+)
+
+rm(seuratSC.Raw.1)
+rm(seuratSC.Raw.2)
+```
+
+# Identify cells per condition and quality control
+
+Identify the CMO codes per experimental condition and biological replicate.
+```{r}
+idCMOs <- read.csv(
+  file = file.path(metadataPath, "identification_cmos.csv"), header = TRUE
+)
+```
+
+```{r}
+seuratSC.Raw.comb@meta.data$Condition <- "Unknown"
+for (i in seq(nrow(idCMOs))) {
+  mod <- seuratSC.Raw.comb@meta.data$hash.ID == idCMOs[i, "cmo_ids"]
+  seuratSC.Raw.comb@meta.data[mod, "Condition"] <- idCMOs[i, "sample_id"]
+}
+```
+
+Remove cells that do not have a unique CMO
+
+```{r}
+validCells <- seuratSC.Raw.comb@meta.data %>% filter(
+  !Condition %in% "Unknown"
+) %>% pull(Cell_ID)
+```
+
+```{r}
+seuratSC.Raw.comb.F <- seuratSC.Raw.comb[, validCells]
+
+rm(seuratSC.Raw.comb)
+```
+
+Create the column "TypeVacc", which refers to the experimental group each cell belongs to. 
+
+```{r}
+seuratSC.Raw.comb.F@meta.data$TypeVacc <- sapply(
+  X = strsplit(x = seuratSC.Raw.comb.F@meta.data$Condition, split = "_"), 
+  FUN = function(x) x[[1]]
+)
+```
+
+## Create Seurat object and pre-processing
+
+```{r}
+genesMetadata <- readRDS(
+  file = file.path(objectsPath, paste0(prefix, ".genesMetadata.rds"))
+)
+```
+
+Create seurat object
+
+```{r}
+genesMetadataF <- genesMetadata[match(rownames(seuratSC.Raw.comb.F), genesMetadata$ENSEMBL), ]
+rownames(genesMetadataF) <- genesMetadataF$ENSEMBL
+genesMetadataFNAs <- genesMetadataF[!is.na(genesMetadataF$SYMBOL),]
+seuratSC.Raw.comb.F.Genes <- seuratSC.Raw.comb.F[genesMetadataFNAs$ENSEMBL, ]
+rm(seuratSC.Raw.comb.F)
+```
+
+```{r}
+rawCountsCheck <- seuratSC.Raw.comb.F.Genes@assays$RNA@counts
+rownames(rawCountsCheck) <- genesMetadataFNAs$SYMBOL
+aggNames <- factor(genesMetadataFNAs$SYMBOL)
+rawCountsAgg <- Matrix.utils::aggregate.Matrix(
+  x = rawCountsCheck, groupings = aggNames, fun = "sum"
+)
+```
+
+```{r}
+seuratSC.Raw.comb.Final <- CreateSeuratObject(
+  counts = rawCountsAgg, 
+  meta.data = seuratSC.Raw.comb.F.Genes@meta.data, 
+  min.features = 1, 
+  min.cells = 1,
+  names.field = 1, 
+  names.delim = "-",
+  project = "Vaccines_001"
+)
+seuratSC.Raw.comb.Final
+
+rm(seuratSC.Raw.comb.F.Genes)
+
+```
+## Normalization and scaling
+
+```{r}
+seuratSC.Norm.comb <- NormalizeData(
+  object = seuratSC.Raw.comb.Final,
+  normalization.method = "LogNormalize",
+  vscale.factor = 10000,
+  verbose = TRUE
+)
+
+rm(seuratSC.Raw.comb.Final)
+```
+
+## Find variable features
+```{r}
+seuratSC.Norm.comb <- FindVariableFeatures(
+  seuratSC.Norm.comb, selection.method = "vst"
+)
+```
+## Scale data
+
+```{r}
+seuratSC.Scal.comb <- ScaleData(
+    object = seuratSC.Norm.comb, 
+    do.scale = TRUE,
+    do.center = TRUE,
+    display.progress = TRUE,
+    vars.to.regress = "nCount_RNA",
+  )
+rm(seuratSC.Norm.comb)
+```
+
+## PCA
+```{r}
+seuratSC.Scal.comb <- RunPCA(
+  seuratSC.Scal.comb,
+  ndims.print = 1:5,
+  nfeatures.print = 30,
+  npcs = 50
+  # reduction.name = "pca_varGenes",
+  # reduction.key = paste("PC_varGenes", i, sep = "_")
+)
+```
+
+# Clustering and 2D representation
+
+## Find clusters
+```{r SelectClusteringResolution}
+pcas <- 1:25
+ress <- c(0.5)
+kList <- c(15)
+
+for (k in kList) {
+  seuratSC.Scal.comb <- FindNeighbors(
+    seuratSC.Scal.comb, 
+    reduction = "pca", 
+    dims = pcas, 
+    # features = useGenes, 
+    compute.SNN = TRUE, 
+    k.param = k, 
+    # return.neighbor = TRUE,
+    nn.method = "annoy", 
+    n.trees = 80,
+    graph.name = paste("k", k, sep = "."),
+    # do.plot = T
+  )  
+  cat(paste(">>> With k =", k, "\n"))
+  for (res in ress) {
+    if (res %in% colnames(seuratSC.Scal.comb@meta.data)) {
+      cat("Resolution already done\n")
+      cat(
+        paste(
+          "res:", res, "Number of clusters detected:", 
+          length(
+            levels(factor(seuratSC.Scal.comb@meta.data[, paste("res", res, sep=".")]))
+          ), "\n"
+        )
+      )
+    } else {
+      seuratSC.Scal.comb <- FindClusters(
+        seuratSC.Scal.comb, 
+        temp.file.location = objectsPath, 
+        algorithm = 2, 
+        n.iter = 20,
+        resolution = res, 
+        verbose = FALSE, 
+        random.seed = 123456,
+        graph.name = paste("k", k, sep = ".")
+      )
+      cat(
+        paste(
+          "   res:", res, "Number of clusters detected:", 
+          length(
+            levels(factor(seuratSC.Scal.comb@meta.data[, paste0("k.", k, "_res.", res)]))
+          ), "\n"
+        )
+      )
+    }
+  }
+}
+```
+
+## UMAP
+```{r}
+seed <- 9876
+n.neighList <- c(15L)
+m.distList <- c(0.6)
+  for (n in n.neighList) {
+    for (dist in m.distList) {
+         seuratSC.Scal.comb <- RunUMAP(
+           seuratSC.Scal.comb, 
+           seed.use = seed, 
+           dims = pcas, 
+           n.neighbors = n,
+           min.dist = dist,
+           n.epochs = 400,
+           reduction.name = paste("umap", n, dist, sep = ".")
+         )
+      }  
+    }
+```
+
+Set final resolution
+```{r}
+seuratSC.Scal.comb$res.Final.1 <- factor(
+  paste0("C", seuratSC.Scal.comb$k.15_res.0.5), 
+  levels = paste0("C", seq(0,  length(unique(seuratSC.Scal.comb$k.15_res.0.5))))
+)
+
+Idents(seuratSC.Scal.comb) <- seuratSC.Scal.comb$res.Final.1
+seuratSC.Scal.comb@reductions$umap.Final <- seuratSC.Scal.comb@reductions$umap.15.0.6
+```
+
+Plot results
+```{r}
+DimPlot(
+  seuratSC.Scal.comb, reduction = "umap.Final", label = TRUE, cols = color.list(), label.box = TRUE
+)
+```
+
+#Identification of cells
+
+##FindAllMarkers
+```{r}
+markersGeneral <- FindAllMarkers(
+    seuratSC.Scal.comb, only.pos = FALSE, 
+    min.pct = 0.25, logfc.threshold = 0.25, test.use = "wilcox"
+  )
+```
+
+## Plot the most significant upregulated genes in each cluster
+```{r}
+markersSignificant <- markersGeneral %>% 
+  filter(abs(avg_log2FC) >= 1, p_val_adj <= 0.05) %>% 
+  arrange(desc(avg_log2FC))
+
+plotGenes <- markersSignificant %>% group_by(cluster) %>%
+    slice_max(n = 4, order_by = avg_log2FC) %>% pull(gene)
+```
+
+```{r, fig.width=10, fig.height=10, warning=FALSE, error=FALSE}
+DotPlotDef(seuratSC.Scal.comb, features = unique(plotGenes)) +
+  theme(axis.text.x = element_text(size = 9), axis.text.y = element_text(size = 9)) + 
+  scale_color_gradientn(
+    colors = colorRampPalette(
+      colors = c("#1189d4", "#1cad3e", "yellow", "orange", "red")
+      )(50)) + 
+  ggtitle("Top markers per cluster") + coord_flip()
+
+#ggsave("Data_cluster_genes.png", path = plotsPath, width=10, height=10)
+
+```
+
+## (!) Identification of contaminating clusters
+
+We found a major set of clusters (C8, C13 and C14) and two extra clusters (C9, C10 and C12) that lack the expression of CD3 and either CD4 or CD8. Therefore, we considered them contaminations and were removed from the analysis. 
+```{r}
+FeaturePlotDef(obj = seuratSC.Scal.comb, feature = "CD3E", dim.reduction = "umap.Final")
+FeaturePlotDef(obj = seuratSC.Scal.comb, feature = "CD4", dim.reduction = "umap.Final") 
+FeaturePlotDef(obj = seuratSC.Scal.comb, feature = "CD8A", dim.reduction = "umap.Final")
+```
+
+## Removal of contaminating cells and re-analysis
+
+###  Identification of contaminating cells
+```{r}
+seuratSC.Scal.comb@meta.data <- mutate(
+  seuratSC.Scal.comb@meta.data,
+  Cell_type_Trim = case_when(
+    res.Final.1 %in% c("C12", "C9", "C10", "C8", "C13", "C14") ~ "Delete",
+    res.Final.1 %in% c("C0","C1", "C2", "C3", "C4","C5", "C6", "C7", "C11") ~ "Keep",
+    TRUE ~ NA_character_
+  )
+)
+
+ValidCellsMarkers <- seuratSC.Scal.comb@meta.data %>% filter (
+  !Cell_type_Trim %in% "Delete"
+) %>% pull(Cell_ID)
+
+rm(seuratSC.Scal.comb)
+```
+
+### Re-load raw data
+
+```{r}
+seuratSC.Raw.1 <- readRDS(
+  file = file.path(objectsPath, paste(prefix, "seuratSC.CMO.Norm.1.rds", sep = "."))
+)
+seuratSC.Raw.2 <- readRDS(
+  file = file.path(objectsPath, paste(prefix, "seuratSC.CMO.Norm.2.rds", sep = "."))
+)
+```
+
+Merge reads from both sequencing lines.
+```{r}
+seuratSC.Raw.comb <- merge(
+  x = seuratSC.Raw.1, y = seuratSC.Raw.2, 
+  add.cell.ids = NULL, project = "TILs-CancerVacc"
+)
+
+rm(seuratSC.Raw.1)
+rm(seuratSC.Raw.2)
+```
+
+### Re-Identify cells per condition and quality control
+
+Identify the CMO codes per experimental condition and biological replicate.
+```{r}
+idCMOs <- read.csv(
+  file = file.path(metadataPath, "identification_cmos.csv"), header = TRUE
+)
+```
+
+```{r}
+seuratSC.Raw.comb@meta.data$Condition <- "Unknown"
+for (i in seq(nrow(idCMOs))) {
+  mod <- seuratSC.Raw.comb@meta.data$hash.ID == idCMOs[i, "cmo_ids"]
+  seuratSC.Raw.comb@meta.data[mod, "Condition"] <- idCMOs[i, "sample_id"]
+}
+```
+
+Remove cells that do not have a unique CMO and that are not contaminating cells (not expressing CD3 and CD4 or CD8)
+
+```{r}
+#seuratSC.Raw.comb.F <- seuratSC.Raw.comb[, validCells]
+seuratSC.Raw.comb.F <- seuratSC.Raw.comb[, ValidCellsMarkers]
+
+rm(seuratSC.Raw.comb)
+```
+
+Create the column "TypeVacc", which refers to the experimental group each cell belongs to. 
+
+```{r}
+seuratSC.Raw.comb.F@meta.data$TypeVacc <- sapply(
+  X = strsplit(x = seuratSC.Raw.comb.F@meta.data$Condition, split = "_"), 
+  FUN = function(x) x[[1]]
+)
+```
+
+### Create Seurat object and pre-processing
+
+```{r}
+genesMetadata <- readRDS(
+  file = file.path(objectsPath, paste0(prefix, ".genesMetadata.rds"))
+)
+```
+
+Create seurat object
+
+```{r}
+genesMetadataF <- genesMetadata[match(rownames(seuratSC.Raw.comb.F), genesMetadata$ENSEMBL), ]
+rownames(genesMetadataF) <- genesMetadataF$ENSEMBL
+genesMetadataFNAs <- genesMetadataF[!is.na(genesMetadataF$SYMBOL),]
+seuratSC.Raw.comb.F.Genes <- seuratSC.Raw.comb.F[genesMetadataFNAs$ENSEMBL, ]
+rm(seuratSC.Raw.comb.F)
+```
+
+```{r}
+rawCountsCheck <- seuratSC.Raw.comb.F.Genes@assays$RNA@counts
+rownames(rawCountsCheck) <- genesMetadataFNAs$SYMBOL
+aggNames <- factor(genesMetadataFNAs$SYMBOL)
+rawCountsAgg <- Matrix.utils::aggregate.Matrix(
+  x = rawCountsCheck, groupings = aggNames, fun = "sum"
+)
+```
+
+```{r}
+seuratSC.Raw.comb.Final <- CreateSeuratObject(
+  counts = rawCountsAgg, 
+  meta.data = seuratSC.Raw.comb.F.Genes@meta.data, 
+  min.features = 1, 
+  min.cells = 1,
+  names.field = 1, 
+  names.delim = "-",
+  project = "Vaccines_001"
+)
+seuratSC.Raw.comb.Final
+
+rm(seuratSC.Raw.comb.F.Genes)
+
+
+#saveRDS(seuratSC.Raw.comb.Final, file = file.path(objectsPath, paste(prefix, "seuratSC.Raw.comb.Final.rds", sep = ".")))
+```
+
+### Normalization and scaling
+
+```{r}
+seuratSC.Norm.comb <- NormalizeData(
+  object = seuratSC.Raw.comb.Final,
+  normalization.method = "LogNormalize",
+  vscale.factor = 10000,
+  verbose = TRUE
+)
+
+rm(seuratSC.Raw.comb.Final)
+```
+
+### Find variable features
+```{r}
+seuratSC.Norm.comb <- FindVariableFeatures(
+  seuratSC.Norm.comb, selection.method = "vst"
+)
+```
+### Scale data
+
+```{r}
+seuratSC.Scal.comb <- ScaleData(
+    object = seuratSC.Norm.comb, 
+    do.scale = TRUE,
+    do.center = TRUE,
+    display.progress = TRUE,
+    vars.to.regress = "nCount_RNA",
+  )
+rm(seuratSC.Norm.comb)
+```
+### PCA
+
+```{r}
+seuratSC.Scal.comb <- RunPCA(
+  seuratSC.Scal.comb,
+  ndims.print = 1:5,
+  nfeatures.print = 30,
+  npcs = 50
+  # reduction.name = "pca_varGenes",
+  # reduction.key = paste("PC_varGenes", i, sep = "_")
+)
+```
+
+### Clustering and 2D representation
+
+### Find clusters
+```{r SelectClusteringResolution}
+pcas <- 1:25
+ress <- c(1)
+kList <- c(50)
+
+for (k in kList) {
+  seuratSC.Scal.comb <- FindNeighbors(
+    seuratSC.Scal.comb, 
+    reduction = "pca", 
+    dims = pcas, 
+    # features = useGenes, 
+    compute.SNN = TRUE, 
+    k.param = k, 
+    # return.neighbor = TRUE,
+    nn.method = "annoy", 
+    n.trees = 80,
+    graph.name = paste("k", k, sep = "."),
+    # do.plot = T
+  )  
+  cat(paste(">>> With k =", k, "\n"))
+  for (res in ress) {
+    if (res %in% colnames(seuratSC.Scal.comb@meta.data)) {
+      cat("Resolution already done\n")
+      cat(
+        paste(
+          "res:", res, "Number of clusters detected:", 
+          length(
+            levels(factor(seuratSC.Scal.comb@meta.data[, paste("res", res, sep=".")]))
+          ), "\n"
+        )
+      )
+    } else {
+      seuratSC.Scal.comb <- FindClusters(
+        seuratSC.Scal.comb, 
+        temp.file.location = objectsPath, 
+        algorithm = 2, 
+        n.iter = 20,
+        resolution = res, 
+        verbose = FALSE, 
+        random.seed = 123456,
+        graph.name = paste("k", k, sep = ".")
+      )
+      cat(
+        paste(
+          "   res:", res, "Number of clusters detected:", 
+          length(
+            levels(factor(seuratSC.Scal.comb@meta.data[, paste0("k.", k, "_res.", res)]))
+          ), "\n"
+        )
+      )
+    }
+  }
+}
+```
+
+### tSNE
+```{r}
+seed <- 9876
+perpList <- c(120)
+  for (perpl in perpList) {
+       seuratSC.Scal.comb <- RunTSNE(
+         seuratSC.Scal.comb, 
+         seed.use = seed, 
+         dims = pcas, 
+         theta = 0.5,
+         tsne.method = "Rtsne", # "Rtsne", # "FIt-SNE", ç, 
+         perplexity = perpl, 
+         reduction.name = paste("tSNE", perpl, sep=".")
+          # , fast_tsne_path = "/opt/FIt-SNE/bin/fast_tsne"
+       )
+    }
+```
+
+
+### Set final resolution
+```{r}
+if (file.exists(file.path(objectsPath, paste0(prefix, ".final.seuratSC.Scal.comb.rds")))) {
+  seuratSC.Scal.comb <- readRDS(file.path(objectsPath, paste0(prefix, ".final.seuratSC.Scal.comb.rds")))
+} else {
+  saveRDS(seuratSC.Scal.comb, file = file.path(objectsPath, paste0(prefix, ".final.seuratSC.Scal.comb.rds")))
+}
+
+seuratSC.Scal.comb$res.Final.1 <- factor(
+  paste0("C", seuratSC.Scal.comb$k.50_res.1), 
+  levels = paste0("C", seq(0,  length(unique(seuratSC.Scal.comb$k.50_res.1))))
+)
+
+Idents(seuratSC.Scal.comb) <- seuratSC.Scal.comb$res.Final.1
+seuratSC.Scal.comb@reductions$tsne.Final <- seuratSC.Scal.comb@reductions$tSNE.120
+```
+
+###Identification of cells
+
+###FindAllMarkers
+```{r}
+markersGeneral <- FindAllMarkers(
+    seuratSC.Scal.comb, only.pos = FALSE, 
+    min.pct = 0.25, logfc.threshold = 0.25, test.use = "wilcox"
+  )
+```
+
+# Name clusters 
+```{r}
+seuratSC.Scal.comb@meta.data <- mutate(
+  seuratSC.Scal.comb@meta.data,
+  Cell_type_Specific_1 = case_when(
+    res.Final.1 == "C0" ~ "CD4+ Trm",
+    res.Final.1 == "C1" ~ "Treg",
+    res.Final.1 == "C2" ~ "CD8+ Tcm",
+    res.Final.1 == "C3" ~ "CD4+ Teff",
+    res.Final.1 == "C4" ~ "CD8+ Teff",
+    res.Final.1 == "C5" ~ "CD8+ Tcm_KLR",
+    res.Final.1 == "C6" ~ "Dividing TC - G2M",
+    res.Final.1 == "C7" ~ "CD8+ Trm cytotoxic ",
+    res.Final.1 == "C8" ~ "Tc IFN",
+    res.Final.1 == "C9" ~ "Dividing TC - G2M CENPA+",
+    res.Final.1 == "C10" ~ "Dividing TC - S",
+    res.Final.1 == "C11" ~ "CD4+ Teff IL7R",
+    res.Final.1 == "C12" ~ "Tc NFKb+",
+    TRUE ~ NA_character_
+  )
+)
+
+#Set colors
+Cell_type_Specific_1 = c(
+    "CD4+ Trm" = color.list()[6],
+    "CD4+ Teff" = color.list()[2],
+    "CD4+ Teff IL7R" = color.list()[3],
+    "CD8+ Teff" = color.list()[4],
+    "CD8+ Trm cytotoxic " = color.list()[5],
+    "CD8+ Tcm" = color.list()[1],
+    "CD8+ Tcm_KLR" = color.list()[7],
+    "Treg" = color.list()[8], 
+    "Tc IFN" = color.list()[9],
+    "Tc NFKb+" = color.list()[10],
+    "Dividing TC - G2M" = color.list()[11],
+    "Dividing TC - G2M CENPA+" = color.list()[12],
+    "Dividing TC - S" = color.list()[13]
+  )
+```
+
+```{r}
+markersGeneral %>%
+    group_by(cluster) %>%
+    slice_max(n = 10, order_by = avg_log2FC)
+```  
+
+# FIG. S5A - Plot the most significant upregulated genes in each cluster
+```{r}
+markersSignificant <- markersGeneral %>% 
+  filter(abs(avg_log2FC) >= 1, p_val_adj <= 0.05) %>% 
+  arrange(desc(avg_log2FC))
+
+seuratSC.Scal.comb@active.ident <- factor(seuratSC.Scal.comb@active.ident, 
+                            levels=c('C0','C3','C11','C4','C7','C2','C5','C1','C8','C12', 'C6', 'C9', 'C10'))
+markersSignificant$cluster <- factor(markersSignificant$cluster, 
+                            levels=c('C0','C3','C11','C4','C7','C2','C5','C1','C8','C12', 'C6', 'C9', 'C10'))
+
+plotGenes <- markersSignificant %>% group_by(cluster) %>% 
+    slice_max(n = 4, order_by = avg_log2FC) %>% pull(gene)
+
+```
+
+```{r, fig.width=10, fig.height=10, warning=FALSE, error=FALSE}
+DotPlotDef(seuratSC.Scal.comb,     
+           clustering.genes = FALSE,
+           clustering.cells = FALSE,features = unique(plotGenes)) +
+  theme(axis.text.x = element_text(size = 9, angle = 45), axis.text.y = element_text(size = 9)) + 
+  scale_color_gradientn(
+    colors = colorRampPalette(
+      #colors = c("#4E79A7", "#1cad3e", "yellow", "orange", "red")
+      colors = c("#5c8f9c", "white", "#654321")
+      )(50)) + 
+  ggtitle("Top DEG genes per cluster") + coord_flip()
+
+```
+
+# FIG. S5B - Plot the most significant upregulated genes in each cluster
+```{r}
+markersSignificantC0 <- markersGeneral %>% 
+  filter(abs(avg_log2FC) >= 1, p_val_adj <= 0.05) %>% 
+  arrange(desc(avg_log2FC)) %>% filter(cluster == "C0")
+
+plotGenesC0 <- markersSignificantC0 %>% pull(gene) %>% {c(head(.,11), tail(.,11))}
+```
+
+```{r, fig.width=10, fig.height=10, warning=FALSE, error=FALSE}
+DotPlotDef(seuratSC.Scal.comb,     
+           clustering.genes = FALSE,
+           clustering.cells = FALSE,features = unique(plotGenesC0)) +
+  theme(axis.text.x = element_text(size = 9, angle = 45), axis.text.y = element_text(size = 9)) + 
+  scale_color_gradientn(
+    colors = colorRampPalette(
+      #colors = c("#4E79A7", "#1cad3e", "yellow", "orange", "red")
+      colors = c("#5c8f9c", "white", "#654321")
+      )(50)) + 
+  ggtitle("Top markers C0") + coord_flip()
+```
+
+
+# FIG. 6D - Violin plot showing the key markers
+```{r, fig.height=15, fig.width=20}
+#Inspired from https://github.com/kstromhaug/oliveira-stromhaug-cd4-code/blob/main/plotting/make_voilin_plots_cd4.R
+
+cluster_order = c('CD4+ Trm','CD4+ Teff','CD4+ Teff IL7R','CD8+ Teff','CD8+ Trm cytotoxic ','CD8+ Tcm','CD8+ Tcm_KLR')
+vgenes <- c('CD44', 'CD69', 'CXCR6', 'BHLHE40', 'ICOS', 'SELL', 'CCR7', 'S1PR1', 'TCF7', 'KLF2')
+
+### make table for ggplot
+setdiff(vgenes, rownames(seuratSC.Scal.comb))
+genexp <- data.frame(t(seuratSC.Scal.comb@assays$RNA@data[vgenes, ]))
+genexp <- cbind(seuratSC.Scal.comb@meta.data[,'Cell_type_Specific_1'], rownames(genexp), genexp); dim(genexp)
+names(genexp)[names(genexp) == 'seuratSC.Scal.comb@meta.data[, \"Cell_type_Specific_1\"]'] <- 'seurat_cluster'
+names(genexp)[names(genexp) == 'rownames(genexp)'] <- 'Row.names'
+genexp.m <- melt(genexp, id.vars=c('Row.names','seurat_cluster'))
+genexp.m$seurat_cluster <- factor(genexp.m$seurat_cluster, levels = cluster_order)
+genexp.m <- na.omit(genexp.m)
+
+###Violinplot
+ggplot(genexp.m) + geom_violin(aes(x=variable, y=value, fill=seurat_cluster), color='black', scale='width', kernel='gaussian', adjust=1.5) + 
+  scale_y_continuous(name="Expression", limits=c(-2, 3), breaks=c(0,3)) +
+  theme(axis.ticks = element_blank()) +
+  facet_grid(rows='seurat_cluster') + 
+  theme_classic() + scale_fill_manual(values=Cell_type_Specific_1) +
+  theme(axis.text.x = element_text(angle = 90)) + xlab('Gene') + NoLegend() + 
+  theme(panel.spacing.y = unit(0, "lines"), strip.text.y = element_blank())
+
+```
+
+# FIG. S5C - Heatmap general T cell characterization
+```{r, fig.height=15, fig.width=20}
+#Inspired from https://jokergoo.github.io/ComplexHeatmap-reference/book/a-single-heatmap.html#split-heatmap-annotations and Oliveira et al, 2022
+cluster_order = c('CD4+ Trm','CD4+ Teff','CD4+ Teff IL7R','CD8+ Teff','CD8+ Trm cytotoxic ','CD8+ Tcm','CD8+ Tcm_KLR','Treg','Tc IFN','Tc NFKb+', 'Dividing TC - G2M', 'Dividing TC - G2M CENPA+', 'Dividing TC - S')
+
+#General TC markers
+vgenes <- c('CD3E','CD4','CD8A','SELL','CCR7','IL7R','CD28','FAS','CD27','ITGAE','ITGAL','ITGAM','ITGAX','PDCD1','TIGIT','HAVCR2', 'LAG3', 'CTLA4', 'KLRG1', 'TNFRSF14', 'BTLA', 'CD160', 'CD38', 'ENTPD1', 'NT5E', 'CD69', 'IL2RA', 'ICOS', 'TNFRSF4', 'TNFRSF9', 'CD40LG', 'CD44', 'GZMA', 'GZMB', 'GZMK', 'GZMM', 'PRF1', 'NKG7', 'IFNG', 'TNF', 'IL17A', 'IL2', 'LEF1', 'TCF7', 'EOMES', 'TBX21', 'PRDM1', 'TOX', 'GATA3', 'ID2', 'ID3', 'NR4A1', 'FOXP3', 'MKI67', 'TOP2A', 'KLRB1', 'KLRC3')
+
+#To check if there is any of the vgenes that is absent in genexp. If so, remove it and proceed. 
+setdiff(vgenes, rownames(seuratSC.Scal.comb))
+
+genexp <- data.frame(t(seuratSC.Scal.comb@assays$RNA@data[vgenes, ]))
+genexp <- cbind(seuratSC.Scal.comb@meta.data[,'Cell_type_Specific_1'], genexp); dim(genexp)
+names(genexp)[names(genexp) == 'seuratSC.Scal.comb@meta.data[, \"Cell_type_Specific_1\"]'] <- 'seurat_cluster'
+
+#Summarize it to get the mean info per cluster and per gene
+genexp.h <-genexp %>% group_by(seurat_cluster) %>% summarise_all(mean)
+genexp.h <- as.data.frame(genexp.h)
+row.names(genexp.h) <- genexp.h$seurat_cluster 
+genexp.h$seurat_cluster <- NULL
+genexp.h <- as.matrix(genexp.h)
+genexp.h <- t(genexp.h)
+
+col_fun = colorRamp2(c(0, 0.5, 1, 2), c("#440154FF", "#31688EFF", "#35B779FF" ,"#FDE725FF"))
+
+#Create object to split columns and rows
+column_split <- rep("group1", 13)
+column_split[1:3] <- "group2"
+column_split[4:7] <- "group3"
+column_split[8] <- "group4"
+column_split[9:10] <- "group5"
+column_split[11:13] <- "group6"
+
+
+#Row split TC general
+row_split <- rep("group1", 57)
+row_split[1:3] <- "group2"
+row_split[4:13] <- "group3"
+row_split[14:22] <- "group4"
+row_split[23:32] <- "group5"
+row_split[33:41] <- "group6"
+row_split[42:55] <- "group7"
+row_split[56:57] <- "group8"
+
+#Plot heatmap
+ComplexHeatmap::Heatmap(
+  genexp.h, 
+  col = col_fun,
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10), name = "Mean expression",
+  column_title_gp = gpar(fontface = "bold", fontsize = 15), 
+  column_title = "Expression of Th signature",
+  column_order = cluster_order,
+  row_order = vgenes,
+  column_names_rot = 45,
+  cluster_columns = FALSE,
+  show_row_dend = FALSE,
+  row_dend_reorder = FALSE,
+  column_split = column_split,
+  column_gap = unit(2, "mm"), 
+  row_split = row_split,
+  row_gap = unit(1, "mm"),
+  row_title = NULL,
+  row_names_side = "left",
+  border = TRUE,
+  width = unit(6.5, "cm"), height = unit(17, "cm"),
+  heatmap_legend_param = list(
+  legend_height = unit(2, "cm"),
+  title_gp = gpar(fontsize = 10)
+  )
+)
+```
+
+# FIG. 6C - tSNE with cluster annotation
+```{r}
+DimPlot(
+  seuratSC.Scal.comb, reduction = "tsne.Final", group.by = "Cell_type_Specific_1", 
+  cols = Cell_type_Specific_1
+) + ggtitle("Specific identification")
+
+```
+
+# FIG. 6E - tSNE density plot for each experimental group
+```{r, fig.width=6, fig.height=3.5}
+#To chose color scales https://cran.r-project.org/web/packages/viridis/vignettes/intro-to-viridis.html
+finalPlots <- cbind(pcaSel, tsneSel, umapSel, seuratSC.Scal.comb@meta.data)
+
+ggplot(finalPlots[finalPlots$TypeVacc == "Naive",], aes(x = TSNE_1, y = TSNE_2)) +
+  geom_point(aes(x = TSNE_1, y = TSNE_2), data = finalPlots[finalPlots$TypeVacc != "Naive",], color = "lightgrey", size=0.5) + 
+  geom_pointdensity(adjust=4, size = 1) +
+  scale_color_viridis_c(limits = c(0,325), option = "magma")+
+  theme_classic() + ggtitle("TSNE by Naive")
+
+ggplot(finalPlots[finalPlots$TypeVacc == "PBS",], aes(x = TSNE_1, y = TSNE_2)) +
+  geom_point(aes(x = TSNE_1, y = TSNE_2), data = finalPlots[finalPlots$TypeVacc != "PBS",], color = "lightgrey", size=0.5) + 
+  geom_pointdensity(adjust=4, size = 1) +
+  scale_color_viridis_c(limits = c(0,325), option = "magma")+
+  theme_classic() + ggtitle("TSNE by PBS")
+
+ggplot(finalPlots[finalPlots$TypeVacc == "PD1",], aes(x = TSNE_1, y = TSNE_2)) +
+  geom_point(aes(x = TSNE_1, y = TSNE_2), data = finalPlots[finalPlots$TypeVacc != "PD1",], color = "lightgrey", size=0.5) + 
+  geom_pointdensity(adjust=4, size = 1) +
+  scale_color_viridis_c(limits = c(0,325), option = "magma")+
+  theme_classic() + ggtitle("TSNE by PD1")
+
+ggplot(finalPlots[finalPlots$TypeVacc == "cDC1",], aes(x = TSNE_1, y = TSNE_2)) +
+  geom_point(aes(x = TSNE_1, y = TSNE_2), data = finalPlots[finalPlots$TypeVacc != "cDC1",], color = "lightgrey", size=0.5) + 
+  geom_pointdensity(adjust=4, size = 1) +
+  scale_color_viridis_c(limits = c(0,325), option = "magma")+
+  theme_classic() + ggtitle("TSNE by cDC1")#+ 
+
+```
+
+# FIG. 6J - GSEA of CD4 Trm cluster compared with CD4 Tem and CD4 IL7R
+```{r, fig.width=6, fig.height=3.5}
+cells_C0 <- seuratSC.Scal.comb@meta.data %>% filter(
+    Cell_type_Specific_1 == "CD4+ Trm") %>% pull(Cell_ID)
+
+cells_CD4_rest <- seuratSC.Scal.comb@meta.data %>% filter(
+    Cell_type_Specific_1 %in% c("CD4+ Teff", "CD4+ Teff Th17")) %>% pull(Cell_ID)
+
+#Compare using Findmarkers
+list_markers_CD4 <- FindMarkers(
+      object = seuratSC.Scal.comb, ident.1 = cells_C0, ident.2 = cells_CD4_rest, 
+      test.use = "wilcox", min.pct = 0.2
+    )  
+
+list_markers_CD4$gene <- rownames(list_markers_CD4)
+
+#Prepare gene datasets 
+mmuGeneSets <- getGenesets(
+  org = "mmu", db = "kegg", cache = TRUE, 
+  return.type = "list", gene.id.type = "SYMBOL"
+)
+mmuGeneSets <- lapply(X = mmuGeneSets, FUN = toupper)
+
+#Run GSEA from ranked genes
+ranks <- list_markers_CD4 %>% arrange(desc(avg_log2FC)) %>% 
+    select(gene, avg_log2FC) %>% deframe()
+
+CD4_K <- fgsea(pathways = mmuGeneSets, stats = ranks, minSize =  10, maxSize = 500)
+
+#Plot most significant pathways 
+CD4_K_sig <- rbind(top_n(CD4_K, 7, NES), top_n(CD4_K, -4, NES))
+CD4_K_sig <- CD4_K_sig[order(CD4_K_sig$NES, decreasing = FALSE),]
+
+#Delete irrelevant rows related with diseases
+CD4_K_sig <-  CD4_K_sig %>% filter(pathway != "mmu05012_Parkinson_disease")
+CD4_K_sig <-  CD4_K_sig %>% filter(pathway != "mmu05016_Huntington_disease")
+CD4_K_sig <-  CD4_K_sig %>% filter(pathway != "mmu05020_Prion_disease")
+CD4_K_sig$pathway <- factor(CD4_K_sig$pathway, levels = CD4_K_sig$pathway)
+
+ggplot(CD4_K_sig, aes(x = NES, y = pathway, fill = pathway)) +
+  geom_bar(stat = "identity") +  # Use geom_bar for barplot
+  scale_fill_manual(values = c(rep("#5c8f9c", each = 4), rep("#654321", each = 4))) +
+  labs(
+    x = "NES",
+    y = "Pathway",
+    fill = "Adjusted p-value"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 2),  # Customize axis text
+    axis.title.x = element_text(size = 14)
+    #axis.title.y = element_text(size = 14)
+  )
+```
+
+# FIG. 6K - Violin plot on selected DEG genes enriched on CD4 Trm compared with CD4 Tem and CD4 IL7R
+```{r, fig.width=6, fig.height=3.5}
+vgenes <- c('CCR5', 'CCR2', 'IFNG', 'TNF','TGFB1', 'CD40LG', 'PDCD1', 'LAG3', 'HAVCR2', 'TNFRSF4', 'TNFRSF9')
+cluster_order = c('C0','C3','C11','C4','C7','C2','C5','C1','C8','C12', 'C6', 'C9', 'C10')
+
+### make table for ggplot
+setdiff(vgenes, rownames(seuratSC.Scal.comb))
+genexp <- data.frame(t(seuratSC.Scal.comb@assays$RNA@data[vgenes, ]))
+genexp <- cbind(seuratSC.Scal.comb@meta.data[,'res.Final.1'], rownames(genexp), genexp); dim(genexp)
+names(genexp)[names(genexp) == 'seuratSC.Scal.comb@meta.data[, \"res.Final.1\"]'] <- 'seurat_cluster'
+names(genexp)[names(genexp) == 'rownames(genexp)'] <- 'Row.names'
+
+genexp.m <- melt(genexp, id.vars=c('Row.names','seurat_cluster'))
+genexp.m$seurat_cluster <- factor(genexp.m$seurat_cluster, levels = cluster_order)
+gcolors <- color.list()[1:13]
+gcolors <- colorsPlots$Cell_type_Specific_1
+gcolors <- unname(gcolors)
+
+
+### Select only relevant clusters
+genexp.m <- genexp.m %>% filter(seurat_cluster %in% c("C0", "C3", "C11"))
+
+
+### plot
+
+ggplot(genexp.m) + geom_violin(aes(x=variable, y=value, fill=seurat_cluster), color='black', scale='width', kernel='gaussian', adjust=1.5) + 
+  scale_y_continuous(name="Expression", limits=c(-2, 3), breaks=c(0,3)) +
+  theme(axis.ticks = element_blank()) +
+  facet_grid(rows='seurat_cluster') + 
+  theme_classic() + scale_fill_manual(values=gcolors) +
+  theme(axis.text.x = element_text(angle = 90)) + xlab('Gene') + NoLegend() + 
+  theme(panel.spacing.y = unit(0, "lines"), strip.text.y = element_blank())
+
+```

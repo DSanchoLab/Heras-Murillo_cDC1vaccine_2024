@@ -1,0 +1,316 @@
+---
+title: 'Figure 7a and b: Correlation of cDC1 signature with CD4 Trm signature from TCGA data'
+author: "Ignacio Heras"
+date: "`r paste0(Sys.Date())`"
+documentclass: article
+output:
+  html_document: 
+    number_sections: yes
+    self_contained: no
+    theme: united
+    toc: yes
+    toc_depth: 5  
+    toc_float: true
+    collapsed: no
+  pdf_document:
+    fig_caption: yes
+    keep_tex: yes
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+urlcolor: blue
+classoption: a4paper
+---
+
+```{r setup, include=FALSE}
+# load packages
+library(limma)
+library(ggpubr)
+library(RColorBrewer)
+library(genefilter)
+library(gage)
+library(fgsea)
+library(MCPcounter)
+library(tidyr)
+library(dplyr)
+library(readxl)
+library(caret)
+
+# Setup of analysis
+# Data are obtained from the Broad Institute Firehouse portal (https://gdac.broadinstitute.org/)
+
+projectPath <- here::here()
+dataPath <- here::here("data")
+dataSKCMPath <- here::here("data/skcm_tcga/gdac.broadinstitute.org_SKCM.mRNAseq_Preprocess.Level_3.2016012800.0.0")
+dataBCPath <- here::here("data/brca_tcga/gdac.broadinstitute.org_BRCA.mRNAseq_Preprocess.Level_3.2016012800.0.0")
+
+metadataPath <- here::here("metadata")
+#objectsPath <- here::here("trial_2", "objects")
+reportsPath <- here::here("reports")
+plotsPath <- here::here("plots")
+#prefix <- "trial_2"
+
+## Settings to knitr
+knitr::opts_chunk$set(
+    fig.align = "center",
+    fig.path = plotsPath,
+    fig.pos = "H",
+    message = FALSE,
+    warning = FALSE,
+    comment = NA,
+    echo = FALSE,
+    dev = c("jpeg"),
+    dpi = 300
+)
+
+```
+
+#SKCM Data preparation
+
+```{r}
+#Prepare the data
+data <- read.delim(file.path(dataSKCMPath, "SKCM.uncv2.mRNAseq_RSEM_normalized_log2.txt"))
+
+##Prepare the data file
+#Pre-cleaning matrix dimention
+dim(data)
+data <- separate(data, col = 'gene', into = c('Symbol', 'ID'), sep = '\\|')
+
+#Remove duplicates and genes with no name
+duplicated <- duplicated(data$Symbol)
+data <- data[!duplicated,]
+data[is.na(data)] <- 0
+
+#Leave genes in colnames and patient code in rownames
+rownames(data) <- data$Symbol
+data$Symbol <- NULL
+data$ID <- NULL
+data <- data[-1,]
+data <- mutate_all(data, function(x) as.numeric(as.character(x)))
+data <- as.data.frame(data)
+
+#Remove normal tissues (patient ID ending in 11 or 12)
+data$TCGA.GN.A4U8.11<- NULL
+dim(data)
+```
+
+#Setup MCP with cDC1 and Trm signatures
+
+```{r}
+# Add our signatures to MCP pre-defined signatures
+## Load MCP signatures
+genes <- read.table(curl("http://raw.githubusercontent.com/ebecht/MCPcounter/master/Signatures/genes.txt"),sep="\t",stringsAsFactors=FALSE,header=TRUE,colClasses="character",check.names=FALSE)
+genes_symbol <- genes[,1:2]
+
+## Load our signatures
+### Cluster 0 upregulated genes
+Costum_C0_up <- c('IFITM3','IFITM2','FURIN','CXCR6','PLAC8','BHLHE40', 'AA467197','IFITM1', 'SERPINB1AA', 'HILPDA', 'S100A4')
+Mouse_CD4_Trm <- data.frame(matrix(nrow = 0, ncol = 2))
+colnames(Mouse_CD4_Trm) <- c("HUGO symbols", "Cell population")
+    Mouse_CD4_Trm <- rbind(Mouse_CD4_Trm, data.frame(
+      "HUGO symbols" = Costum_C0_up,
+      "Cell population" = "Mouse_CD4_Trm"))
+colnames(Mouse_CD4_Trm) <- c("HUGO symbols", "Cell population")
+
+### Human CD4 Trm genes (obtained from Supplementary Table 3 from Savas et al, 2018)
+geneSignatures <- sapply(
+  X = dir(file.path(metadataPath, "GeneSignatures"), full.names = TRUE),
+  FUN = function(x) {
+    return(as.vector(data.table::fread(file = x, header = FALSE)))
+  }
+)
+names(geneSignatures) <- gsub(
+  pattern = ".csv.V1", replacement = "", x = basename(names(geneSignatures))
+)
+geneSignatures <- lapply(geneSignatures, FUN = function(x) toupper(x))
+geneSignatures$CD4_Trm_Signature <- sub("'", "", geneSignatures$CD4_Trm_Signature, fixed = TRUE)
+
+Human_CD4_Trm <- data.frame(matrix(nrow = 0, ncol = 2))
+colnames(Human_CD4_Trm) <- c("HUGO symbols", "Cell population")
+    Human_CD4_Trm <- rbind(Human_CD4_Trm, data.frame(
+      "HUGO symbols" = geneSignatures$CD4_Trm_Signature,
+      "Cell population" = "Human CD4+ Trm"))
+colnames(Human_CD4_Trm) <- c("HUGO symbols", "Cell population")
+
+### cDC1 signatures
+cDC1_02 <- c('CLNK', 'BATF3', 'XCR1', 'CLEC9A')
+
+cDC1_Cell <- data.frame(matrix(nrow = 0, ncol = 2))
+colnames(cDC1_Cell) <- c("HUGO symbols", "Cell population")
+    cDC1_Cell <- rbind(cDC1_Cell, data.frame(
+      "HUGO symbols" = cDC1_02,
+      "Cell population" = "cDC1_Cell"))
+colnames(cDC1_Cell) <- c("HUGO symbols", "Cell population")
+
+#Random genes
+sample <- sample(rownames(data), size = 30, replace = FALSE, prob = NULL)
+
+Random <- data.frame(matrix(nrow = 0, ncol = 2))
+colnames(Random) <- c("HUGO symbols", "Cell population")
+    Random <- rbind(Random, data.frame(
+      "HUGO symbols" = sample,
+      "Cell population" = "Random"))
+colnames(Random) <- c("HUGO symbols", "Cell population")
+
+
+# Sum them up
+genes <- rbind(genes_symbol, Mouse_CD4_Trm, Human_CD4_Trm, cDC1_Cell, Random)
+
+#Run MCP
+MCP <- MCPcounter.estimate(data,featuresType=c("HUGO_symbols")[1],
+		probesets=read.table(curl("http://raw.githubusercontent.com/ebecht/MCPcounter/master/Signatures/probesets.txt"),sep="\t",stringsAsFactors=FALSE,colClasses="character"),
+		genes=genes
+)
+
+
+MCP <- t(MCP)
+MCP <- as.data.frame(MCP)
+
+
+```
+
+#Plot SKCM data
+```{r}
+#Plot normalized samples
+
+norm_cDC1 <- preProcess(as.data.frame(MCP$cDC1_Cell), method=c("range"))
+norm_cDC1 <- predict(norm_cDC1, as.data.frame(MCP$cDC1_Cell))
+
+norm_mouse <- preProcess(as.data.frame(MCP$Mouse_CD4_Trm), method=c("range"))
+norm_mouse <- predict(norm_mouse, as.data.frame(MCP$Mouse_CD4_Trm))
+
+norm_human <- preProcess(as.data.frame(MCP$`Human CD4+ Trm`), method=c("range"))
+norm_human <- predict(norm_human, as.data.frame(MCP$`Human CD4+ Trm`))
+
+norm_MCP <- cbind("cDC1_Cell" = norm_cDC1, "Mouse_CD4_Trm"= norm_mouse, "Human_CD4_Trm"= norm_human)
+colnames(norm_MCP) = c("cDC1_Cell" , "Mouse_CD4_Trm" , "Human_CD4_Trm")
+
+
+p1 <- ggscatter(
+  norm_MCP, x= "cDC1_Cell", 
+  y = "Mouse_CD4_Trm",
+  color = "black", 
+  size = 1,
+  #rug = TRUE,
+  #fill = "Tissue",
+  add = "reg.line", conf.int = TRUE, 
+  #palette = color.list(),
+  cor.coef = TRUE, cor.method = "pearson", 
+) + #geom_smooth(method = "lm", colour = mycol, se = FALSE) + 
+  theme_classic2() + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p2 <- ggscatter(
+  norm_MCP, x= "cDC1_Cell", 
+  y = "Human_CD4_Trm",
+  color = "black", 
+  size = 1,
+  #rug = TRUE,
+  #fill = "Tissue",
+  add = "reg.line", conf.int = TRUE, 
+  #palette = color.list(),
+  cor.coef = TRUE, cor.method = "pearson", 
+) + #geom_smooth(method = "lm", colour = mycol, se = FALSE) + 
+  theme_classic2() + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+plot <- ggarrange(plotlist = list(p1, p2), align = "hv")
+
+annotate_figure(
+  plot, top = text_grob("SKCM - correlation to CD4 Trm Score", face = "bold", size = 14)
+)
+```
+
+
+
+#BRCA Data preparation
+```{r}
+#Prepare the data
+data <- read.delim(file.path(dataBCPath, "BRCA.uncv2.mRNAseq_RSEM_normalized_log2.txt"))
+
+##Prepare the data file
+#Pre-cleaning matrix dimention
+data <- separate(data, col = 'gene', into = c('Symbol', 'ID'), sep = '\\|')
+
+#Remove duplicates and genes with no name
+duplicated <- duplicated(data$Symbol)
+data <- data[!duplicated,]
+data[is.na(data)] <- 0
+
+#Leave genes in colnames and patient code in rownames
+rownames(data) <- data$Symbol
+data$Symbol <- NULL
+data$ID <- NULL
+data <- data[-1,]
+data <- mutate_all(data, function(x) as.numeric(as.character(x)))
+data <- as.data.frame(data)
+
+data <- data %>% select(-contains("11")) 
+dim(data)
+```
+
+#Setup MCP with cDC1 and Trm signatures
+
+```{r}
+#Load gene signatures
+MCP <- MCPcounter.estimate(data,featuresType=c("HUGO_symbols")[1],
+		probesets=read.table(curl("http://raw.githubusercontent.com/ebecht/MCPcounter/master/Signatures/probesets.txt"),sep="\t",stringsAsFactors=FALSE,colClasses="character"),
+		genes=genes
+)
+
+MCP <- t(MCP)
+MCP <- as.data.frame(MCP)
+
+```
+
+#Plot BRCA data
+```{r}
+norm_cDC1 <- preProcess(as.data.frame(MCP$cDC1_Cell), method=c("range"))
+norm_cDC1 <- predict(norm_cDC1, as.data.frame(MCP$cDC1_Cell))
+
+norm_mouse <- preProcess(as.data.frame(MCP$Mouse_CD4_Trm), method=c("range"))
+norm_mouse <- predict(norm_mouse, as.data.frame(MCP$Mouse_CD4_Trm))
+
+norm_human <- preProcess(as.data.frame(MCP$`Human CD4+ Trm`), method=c("range"))
+norm_human <- predict(norm_human, as.data.frame(MCP$`Human CD4+ Trm`))
+
+norm_MCP <- cbind("cDC1_Cell" = norm_cDC1, "Mouse_CD4_Trm"= norm_mouse, "Human_CD4_Trm"= norm_human)
+colnames(norm_MCP) = c("cDC1_Cell" , "Mouse_CD4_Trm" , "Human_CD4_Trm")
+
+
+p1 <- ggscatter(
+  norm_MCP, x= "cDC1_Cell", 
+  y = "Mouse_CD4_Trm",
+  color = "black", 
+  size = 1,
+  #rug = TRUE,
+  #fill = "Tissue",
+  add = "reg.line", conf.int = TRUE, 
+  #palette = color.list(),
+  cor.coef = TRUE, cor.method = "pearson", 
+) + #geom_smooth(method = "lm", colour = mycol, se = FALSE) + 
+  theme_classic2() + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p2 <- ggscatter(
+  norm_MCP, x= "cDC1_Cell", 
+  y = "Human_CD4_Trm",
+  color = "black", 
+  size = 1,
+  #rug = TRUE,
+  #fill = "Tissue",
+  add = "reg.line", conf.int = TRUE, 
+  #palette = color.list(),
+  cor.coef = TRUE, cor.method = "pearson", 
+) + #geom_smooth(method = "lm", colour = mycol, se = FALSE) + 
+  theme_classic2() + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+plot <- ggarrange(plotlist = list(p1, p2), align = "hv")
+
+annotate_figure(
+  plot, top = text_grob("BRCA - correlation to CD4 Trm Score", face = "bold", size = 14)
+)
+
+```
+

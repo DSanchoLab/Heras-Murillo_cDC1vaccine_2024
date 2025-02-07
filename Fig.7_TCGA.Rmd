@@ -35,6 +35,11 @@ library(tidyr)
 library(dplyr)
 library(readxl)
 library(caret)
+library(readr)
+library(stringr)
+library(purrr)
+library(ggsurvfit)
+library(survival)
 
 # Setup of analysis
 # Data are obtained from the Broad Institute Firehouse portal (https://gdac.broadinstitute.org/)
@@ -68,20 +73,19 @@ knitr::opts_chunk$set(
 #SKCM Data preparation
 
 ```{r}
-#Prepare the data
+#Prepare the transcriptomics data 
 data <- read.delim(file.path(dataSKCMPath, "SKCM.uncv2.mRNAseq_RSEM_normalized_log2.txt"))
 
-##Prepare the data file
-#Pre-cleaning matrix dimention
+##Pre-cleaning matrix dimention
 dim(data)
 data <- separate(data, col = 'gene', into = c('Symbol', 'ID'), sep = '\\|')
 
-#Remove duplicates and genes with no name
+##Remove duplicates and genes with no name
 duplicated <- duplicated(data$Symbol)
 data <- data[!duplicated,]
 data[is.na(data)] <- 0
 
-#Leave genes in colnames and patient code in rownames
+##Leave genes in colnames and patient code in rownames
 rownames(data) <- data$Symbol
 data$Symbol <- NULL
 data$ID <- NULL
@@ -89,10 +93,18 @@ data <- data[-1,]
 data <- mutate_all(data, function(x) as.numeric(as.character(x)))
 data <- as.data.frame(data)
 
-#Remove normal tissues (patient ID ending in 11 or 12)
+##Remove normal tissues (patient ID ending in 11 or 12)
 data$TCGA.GN.A4U8.11<- NULL
 dim(data)
+
+
+#Prepare the clinical data
+
+clinicalMetadata <- file.path(dataPath, "clinical_tcga", "synapse-clinical-data.csv") %>% 
+  read_csv()
+
 ```
+
 
 #Setup MCP with cDC1 and Trm signatures
 
@@ -129,7 +141,7 @@ Human_CD4_Trm <- data.frame(matrix(nrow = 0, ncol = 2))
 colnames(Human_CD4_Trm) <- c("HUGO symbols", "Cell population")
     Human_CD4_Trm <- rbind(Human_CD4_Trm, data.frame(
       "HUGO symbols" = geneSignatures$CD4_Trm_Signature,
-      "Cell population" = "Human CD4+ Trm"))
+      "Cell population" = "Human_CD4_Trm"))
 colnames(Human_CD4_Trm) <- c("HUGO symbols", "Cell population")
 
 ### cDC1 signatures
@@ -162,14 +174,12 @@ MCP <- MCPcounter.estimate(data,featuresType=c("HUGO_symbols")[1],
 		genes=genes
 )
 
-
 MCP <- t(MCP)
 MCP <- as.data.frame(MCP)
-
-
 ```
 
-#Plot SKCM data
+# SKCM correlation
+
 ```{r}
 #Plot normalized samples
 
@@ -180,7 +190,7 @@ norm_mouse <- preProcess(as.data.frame(MCP$Mouse_CD4_Trm), method=c("range"))
 norm_mouse <- predict(norm_mouse, as.data.frame(MCP$Mouse_CD4_Trm))
 
 norm_human <- preProcess(as.data.frame(MCP$`Human CD4+ Trm`), method=c("range"))
-norm_human <- predict(norm_human, as.data.frame(MCP$`Human CD4+ Trm`))
+norm_human <- predict(norm_human, as.data.frame(MCP$`Human_CD4_Trm`))
 
 norm_MCP <- cbind("cDC1_Cell" = norm_cDC1, "Mouse_CD4_Trm"= norm_mouse, "Human_CD4_Trm"= norm_human)
 colnames(norm_MCP) = c("cDC1_Cell" , "Mouse_CD4_Trm" , "Human_CD4_Trm")
@@ -221,7 +231,172 @@ annotate_figure(
 )
 ```
 
+# SKCM survival data preparation and analysis
 
+```{r}
+# Adapt MCP
+MCP.scatter <- MCP %>% as.data.frame() %>% 
+  filter(!grepl("1[10]$", rownames(.)))
+MCP.scatter <- MCP.scatter %>% as.data.frame() %>%  rename_with(~ paste0("MCP_", .x))  %>% mutate(
+    SAMPLE_ID = rownames(.)) %>% mutate(SAMPLE_ID = str_sub(SAMPLE_ID, 1, nchar(SAMPLE_ID) - 3)) %>% mutate(SAMPLE_ID = gsub("\\.", "-", SAMPLE_ID))
+
+
+# Combine with filtered clinical data
+
+## I added the male filter and OS > 0 filter.
+clinicalMetadata.SK <- clinicalMetadata %>% filter(type == "SKCM") %>% filter(OS.time > 0)
+
+clinicalMetadata.SK.f <- clinicalMetadata.SK %>% select(
+  bcr_patient_barcode, age_at_initial_pathologic_diagnosis, gender, 
+  OS, OS.time, 
+  DSS, DSS.time, 
+  DFI, DFI.time, 
+  PFI, PFI.time
+) %>% mutate(
+  across(
+    c(OS, DSS, DFI, PFI, ends_with("time"), age_at_initial_pathologic_diagnosis), 
+    as.integer
+  )
+)
+
+#Merge MCP with clinical data
+clinicalMetadata.SK.f.deconv <- MCP.scatter %>% left_join(
+  clinicalMetadata.SK.f,
+  by = c("SAMPLE_ID" = "bcr_patient_barcode")
+) 
+
+# Create tertiles
+clinicalMetadata.SK.f.deconv <- clinicalMetadata.SK.f.deconv %>% mutate(
+  MCP_cDC1_tertiles = cut(
+     MCP_cDC1_Cell, 
+     breaks = quantile(
+       MCP_cDC1_Cell, probs = seq(0, 1, by = 1/3)
+     ), 
+     include.lowest = TRUE, labels = c("Low", "Medium", "High")
+   ),
+    Mouse_CD4_Trm_tertiles = cut(
+     MCP_Mouse_CD4_Trm, 
+     breaks = quantile(
+       MCP_Mouse_CD4_Trm, probs = seq(0, 1, by = 1/3)
+     ), 
+     include.lowest = TRUE, labels = c("Low", "Medium", "High")
+   ),
+      Human_CD4_Trm_tertiles = cut(
+     MCP_Human_CD4_Trm, 
+     breaks = quantile(
+       MCP_Human_CD4_Trm, probs = seq(0, 1, by = 1/3)
+     ), 
+     include.lowest = TRUE, labels = c("Low", "Medium", "High")
+   )
+) 
+
+# Plot survival
+map(
+  colnames(clinicalMetadata.SK.f.deconv) %>% grep("MCP_cDC1_tertiles", ., value = T), 
+  \(cond) {
+    survfit2(
+      as.formula(paste0("Surv(OS.time, OS) ~ ", cond)), 
+      data = clinicalMetadata.SK.f.deconv
+    ) %>% ggsurvfit() + add_risktable() + 
+      ggtitle(paste0("Survival curves split by median cell abundance [", cond, "]"))
+  }
+)
+
+map(
+  colnames(clinicalMetadata.SK.f.deconv) %>% grep("Mouse_CD4_Trm_tertiles", ., value = T), 
+  \(cond) {
+    survfit2(
+      as.formula(paste0("Surv(OS.time, OS) ~ ", cond)), 
+      data = clinicalMetadata.SK.f.deconv
+    ) %>% ggsurvfit() + add_risktable() + 
+      ggtitle(paste0("Survival curves split by median cell abundance [", cond, "]"))
+  }
+)
+
+map(
+  colnames(clinicalMetadata.SK.f.deconv) %>% grep("Human_CD4_Trm_tertiles", ., value = T), 
+  \(cond) {
+    survfit2(
+      as.formula(paste0("Surv(OS.time, OS) ~ ", cond)), 
+      data = clinicalMetadata.SK.f.deconv
+    ) %>% ggsurvfit() + add_risktable() + 
+      ggtitle(paste0("Survival curves split by median cell abundance [", cond, "]"))
+  }
+)
+
+# Calculate statistical survival differences between groups
+
+res.surv.all <- survdiff(
+  as.formula(paste0("Surv(OS.time, OS) ~ MCP_cDC1_tertiles")), 
+  data = clinicalMetadata.SK.f.deconv %>% mutate(
+    MCP_cDC1_tertiles = factor(MCP_cDC1_tertiles, levels = c("Low",  "High"))
+  )
+) 
+res.surv.all
+
+res.surv.all <- survdiff(
+  as.formula(paste0("Surv(OS.time, OS) ~ Mouse_CD4_Trm_tertiles")), 
+  data = clinicalMetadata.SK.f.deconv %>% mutate(
+    Mouse_CD4_Trm_tertiles = factor(Mouse_CD4_Trm_tertiles, levels = c("Low",  "High"))
+  )
+) 
+res.surv.all
+
+res.surv.all <- survdiff(
+  as.formula(paste0("Surv(OS.time, OS) ~ Human_CD4_Trm_tertiles")), 
+  data = clinicalMetadata.SK.f.deconv %>% mutate(
+    Human_CD4_Trm_tertiles = factor(Human_CD4_Trm_tertiles, levels = c("Low",  "High"))
+  )
+) 
+res.surv.all
+
+# Calculate hazard ratios with 95% CI
+
+group_columns <- colnames(clinicalMetadata.SK.f.deconv) %>% grep("_tertiles", ., value = T)
+results <- lapply(group_columns, function(group_col) {
+  # Run Cox model for each group column
+  model <- coxph(Surv(OS.time, OS) ~ clinicalMetadata.SK.f.deconv[[group_col]], data = clinicalMetadata.SK.f.deconv)
+  hr <- exp(coef(model))  # Hazard ratio
+  ci <- exp(confint(model))  # Confidence interval
+  
+  # Store results in a data frame
+  data.frame(
+    sample = group_col,  # Column name as identifier
+    group = names(hr),   # Group label
+    hazard_ratio = hr,
+    lower_ci = ci[, 1],
+    upper_ci = ci[, 2]
+  )
+})
+
+# Combine all results into one data frame
+plot_data <- bind_rows(results)
+plot_data <- plot_data %>%
+  filter(grepl("High", group))
+plot_data$sample <- factor(plot_data$sample, levels = rev(group_columns))
+plot_data$background <- rep(c("gray90", "white"), length.out = nrow(plot_data))
+
+
+# Plot all hazard ratios together
+ggplot(plot_data, aes(y = sample, x = hazard_ratio)) +
+  geom_tile(aes(fill = background), width = Inf, height = 0.8, alpha = 0.3) +  # Fondo alterno
+  geom_point(shape = 22, size = 20, fill = "black") +  # Square points
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0.0) +
+  scale_x_log10() +  # Log scale for hazard ratios
+  xlim(NA, 1) +  # Establece el límite máximo del eje x en 1
+  geom_vline(xintercept = 1, color = "black") +
+  labs(
+    title = "Hazard Ratios for 'High' Level with 95% Confidence Intervals",
+    x = "Hazard Ratio (log scale)",
+    y = "Sample"
+  ) +
+  scale_fill_identity() +  # Usar los colores de fondo definidos en `background`
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(hjust = 1)
+  )
+
+```
 
 #BRCA Data preparation
 ```{r}
@@ -247,9 +422,13 @@ data <- as.data.frame(data)
 
 data <- data %>% select(-contains("11")) 
 dim(data)
+
+# Prepare clinical data 
+clinicalMetadata <- file.path(dataPath, "clinical_tcga", "synapse-clinical-data.csv") %>% 
+  read_csv()
 ```
 
-#Setup MCP with cDC1 and Trm signatures
+# Setup MCP with cDC1 and Trm signatures
 
 ```{r}
 #Load gene signatures
@@ -263,7 +442,7 @@ MCP <- as.data.frame(MCP)
 
 ```
 
-#Plot BRCA data
+# BRCA correlations
 ```{r}
 norm_cDC1 <- preProcess(as.data.frame(MCP$cDC1_Cell), method=c("range"))
 norm_cDC1 <- predict(norm_cDC1, as.data.frame(MCP$cDC1_Cell))
@@ -271,8 +450,8 @@ norm_cDC1 <- predict(norm_cDC1, as.data.frame(MCP$cDC1_Cell))
 norm_mouse <- preProcess(as.data.frame(MCP$Mouse_CD4_Trm), method=c("range"))
 norm_mouse <- predict(norm_mouse, as.data.frame(MCP$Mouse_CD4_Trm))
 
-norm_human <- preProcess(as.data.frame(MCP$`Human CD4+ Trm`), method=c("range"))
-norm_human <- predict(norm_human, as.data.frame(MCP$`Human CD4+ Trm`))
+norm_human <- preProcess(as.data.frame(MCP$`Human_CD4_Trm`), method=c("range"))
+norm_human <- predict(norm_human, as.data.frame(MCP$`Human_CD4_Trm`))
 
 norm_MCP <- cbind("cDC1_Cell" = norm_cDC1, "Mouse_CD4_Trm"= norm_mouse, "Human_CD4_Trm"= norm_human)
 colnames(norm_MCP) = c("cDC1_Cell" , "Mouse_CD4_Trm" , "Human_CD4_Trm")
@@ -314,3 +493,175 @@ annotate_figure(
 
 ```
 
+# BRCA survival data preparation and analysis
+
+
+```{r}
+#Adapt MCP
+MCP.scatter <- MCP %>% as.data.frame() %>% 
+  filter(!grepl("1[10]$", rownames(.)))
+MCP.scatter <- MCP.scatter %>% as.data.frame() %>%  rename_with(~ paste0("MCP_", .x))  %>% mutate(
+    SAMPLE_ID = rownames(.)) %>% mutate(SAMPLE_ID = str_sub(SAMPLE_ID, 1, nchar(SAMPLE_ID) - 3)) %>% mutate(SAMPLE_ID = gsub("\\.", "-", SAMPLE_ID))
+
+#Combine filtered clinical data 
+#I added the male filter and OS > 0 filter, as in the JITC from Cueto et al. 
+clinicalMetadata.BC <- clinicalMetadata %>% filter(type == "BRCA") %>% filter(gender == "FEMALE") %>% filter(OS.time > 0)
+
+clinicalMetadata.BC.f <- clinicalMetadata.BC %>% select(
+  bcr_patient_barcode, age_at_initial_pathologic_diagnosis, gender, 
+  OS, OS.time, 
+  DSS, DSS.time, 
+  DFI, DFI.time, 
+  PFI, PFI.time
+) %>% mutate(
+  across(
+    c(OS, DSS, DFI, PFI, ends_with("time"), age_at_initial_pathologic_diagnosis), 
+    as.integer
+  )
+)
+
+#Merge MCP with clinical data
+clinicalMetadata.BC.f.deconv <- MCP.scatter %>% left_join(
+  clinicalMetadata.BC.f,
+  by = c("SAMPLE_ID" = "bcr_patient_barcode")
+) 
+
+#Create tertiles 
+
+clinicalMetadata.BC.f.deconv <- clinicalMetadata.BC.f.deconv %>% mutate(
+  MCP_cDC1_tertiles = cut(
+     MCP_cDC1_Cell, 
+     breaks = quantile(
+       MCP_cDC1_Cell, probs = seq(0, 1, by = 1/3)
+     ), 
+     include.lowest = TRUE, labels = c("Low", "Medium", "High")
+   ),
+    Mouse_CD4_Trm_tertiles = cut(
+     MCP_Mouse_CD4_Trm, 
+     breaks = quantile(
+       MCP_Mouse_CD4_Trm, probs = seq(0, 1, by = 1/3)
+     ), 
+     include.lowest = TRUE, labels = c("Low", "Medium", "High")
+   ),
+      Human_CD4_Trm_tertiles = cut(
+     MCP_Human_CD4_Trm, 
+     breaks = quantile(
+       MCP_Human_CD4_Trm, probs = seq(0, 1, by = 1/3)
+     ), 
+     include.lowest = TRUE, labels = c("Low", "Medium", "High")
+   )
+) 
+
+#Plot survival map
+
+
+map(
+  colnames(clinicalMetadata.BC.f.deconv) %>% grep("MCP_cDC1_tertiles", ., value = T), 
+  \(cond) {
+    survfit2(
+      as.formula(paste0("Surv(OS.time, OS) ~ ", cond)), 
+      data = clinicalMetadata.BC.f.deconv
+    ) %>% ggsurvfit() + add_risktable() + 
+      ggtitle(paste0("Survival curves split by median cell abundance [", cond, "]"))
+  }
+)
+
+ggsave("Surv_MCP_cDC1_tertiles.pdf", path = plotsPath, width=10, height=10)
+
+map(
+  colnames(clinicalMetadata.BC.f.deconv) %>% grep("Mouse_CD4_Trm_tertiles", ., value = T), 
+  \(cond) {
+    survfit2(
+      as.formula(paste0("Surv(OS.time, OS) ~ ", cond)), 
+      data = clinicalMetadata.BC.f.deconv
+    ) %>% ggsurvfit() + add_risktable() + 
+      ggtitle(paste0("Survival curves split by median cell abundance [", cond, "]"))
+  }
+)
+
+ggsave("Surv_Mouse_CD4_Trm_tertiles.pdf", path = plotsPath, width=10, height=10)
+
+map(
+  colnames(clinicalMetadata.BC.f.deconv) %>% grep("Human_CD4_Trm_tertiles", ., value = T), 
+  \(cond) {
+    survfit2(
+      as.formula(paste0("Surv(OS.time, OS) ~ ", cond)), 
+      data = clinicalMetadata.BC.f.deconv
+    ) %>% ggsurvfit() + add_risktable() + 
+      ggtitle(paste0("Survival curves split by median cell abundance [", cond, "]"))
+  }
+)
+
+#Calculate statistical significance 
+
+res.surv.all <- survdiff(
+  as.formula(paste0("Surv(OS.time, OS) ~ MCP_cDC1_tertiles")), 
+  data = clinicalMetadata.BC.f.deconv %>% mutate(
+    MCP_cDC1_tertiles = factor(MCP_cDC1_tertiles, levels = c("Low",  "High"))
+  )
+) 
+res.surv.all
+
+res.surv.all <- survdiff(
+  as.formula(paste0("Surv(OS.time, OS) ~ Mouse_CD4_Trm_tertiles")), 
+  data = clinicalMetadata.BC.f.deconv %>% mutate(
+    Mouse_CD4_Trm_tertiles = factor(Mouse_CD4_Trm_tertiles, levels = c("Low",  "High"))
+  )
+) 
+res.surv.all
+
+res.surv.all <- survdiff(
+  as.formula(paste0("Surv(OS.time, OS) ~ Human_CD4_Trm_tertiles")), 
+  data = clinicalMetadata.BC.f.deconv %>% mutate(
+    Human_CD4_Trm_tertiles = factor(Human_CD4_Trm_tertiles, levels = c("Low",  "High"))
+  )
+) 
+res.surv.all
+
+
+###Do hazard ratio analysis of all
+
+group_columns <- colnames(clinicalMetadata.BC.f.deconv) %>% grep("_tertiles", ., value = T)
+results <- lapply(group_columns, function(group_col) {
+  # Run Cox model for each group column
+  model <- coxph(Surv(OS.time, OS) ~ clinicalMetadata.BC.f.deconv[[group_col]], data = clinicalMetadata.BC.f.deconv)
+  hr <- exp(coef(model))  # Hazard ratio
+  ci <- exp(confint(model))  # Confidence interval
+  
+  # Store results in a data frame
+  data.frame(
+    sample = group_col,  # Column name as identifier
+    group = names(hr),   # Group label
+    hazard_ratio = hr,
+    lower_ci = ci[, 1],
+    upper_ci = ci[, 2]
+  )
+})
+
+# Combine all results into one data frame
+plot_data <- bind_rows(results)
+plot_data <- plot_data %>%
+  filter(grepl("High", group))
+plot_data$sample <- factor(plot_data$sample, levels = rev(group_columns))
+plot_data$background <- rep(c("gray90", "white"), length.out = nrow(plot_data))
+
+
+# Plot all hazard ratios together
+ggplot(plot_data, aes(y = sample, x = hazard_ratio)) +
+  geom_tile(aes(fill = background), width = Inf, height = 0.8, alpha = 0.3) +  # Fondo alterno
+  geom_point(shape = 22, size = 20, fill = "black") +  # Square points
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0.0) +
+  scale_x_log10() +  # Log scale for hazard ratios
+  xlim(NA, 1) +  # Establece el límite máximo del eje x en 1
+  geom_vline(xintercept = 1, color = "black") +
+  labs(
+    title = "Hazard Ratios for 'High' Level with 95% Confidence Intervals",
+    x = "Hazard Ratio (log scale)",
+    y = "Sample"
+  ) +
+  scale_fill_identity() +  # Usar los colores de fondo definidos en `background`
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(hjust = 1)
+  )
+```

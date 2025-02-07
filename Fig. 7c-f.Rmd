@@ -1,0 +1,648 @@
+---
+title: "Figure 7c-f: re-cluster CD4 T cells from Wu et al, find CD4 Trms and correlate with cDC1s"
+author: "Ignacio Heras"
+documentclass: article
+output:
+  html_document: 
+    number_sections: yes
+    self_contained: no
+    theme: united
+    toc: yes
+    toc_depth: 5  
+    toc_float: true
+    collapsed: no
+  pdf_document:
+    fig_caption: yes
+    keep_tex: yes
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+urlcolor: blue
+classoption: a4paper
+---
+
+```{r setup, include=FALSE}
+## packages
+suppressMessages(library("Matrix"))
+suppressMessages(library("ggplot2"))
+suppressMessages(library("ggrepel"))
+suppressMessages(library("ggpubr"))
+suppressMessages(library("ggridges"))
+suppressMessages(library("dplyr"))
+suppressMessages(library("tidyr"))
+suppressMessages(library("readr"))
+suppressMessages(library("biomaRt"))
+suppressMessages(library("Seurat"))
+suppressMessages(library("scater"))
+suppressMessages(library("org.Mm.eg.db"))
+suppressMessages(library("ggvenn"))
+suppressMessages(library("gtools"))
+suppressMessages(library("viridis"))
+suppressMessages(library("plotly"))
+suppressMessages(library("Matrix.utils"))
+library(colorRamp2)
+suppressMessages(library("SingleCellExperiment"))
+
+## paths
+projectPath <- here::here()
+dataPath <- here::here("data")
+metadataPath <- here::here("metadata")
+sourceCode <- here::here("src")
+objectsPath <- here::here("trial5")
+processedPath <- here::here("trial5/processed_data")
+reportsPath <- here::here("reports")
+plotsPath <- here::here(reportsPath, "plots")
+prefix <- "trial5"
+
+## scr code
+source(file.path(sourceCode, "helperFunctions.R"))
+
+## rmarkdown settings
+knitr::opts_chunk$set(
+  echo = FALSE,
+  fig.align = "center",
+  fig.path = file.path(reportsPath, "plots/"),
+  fig.pos = "H",
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  dev = "png",
+  dpi = 300
+)
+
+## global options
+options(encoding = 'UTF-8')
+```
+
+
+# Loading data
+
+```{r}
+## metadata
+cellsMetadata <- read.csv(
+  file.path(dataPath, "SingleCellPortal", "metadata", "Whole_miniatlas_meta.csv")
+)[-1, ]
+rownames(cellsMetadata) <- cellsMetadata$NAME
+```
+
+
+```{r}
+if (file.exists(file.path(objectsPath, paste(prefix, "seurat.BC.rds", sep = ".")))) {
+  seurat.BC <- readRDS(
+    file.path(objectsPath, paste(prefix, "seurat.BC.rds", sep = "."))
+  )
+} else {
+  ## reading raw counts
+  scDataDir <- file.path(dataPath, "SingleCellPortal", "BrCa_Atlas_Count_out")
+  rawData <- Read10X(data.dir = scDataDir)
+  if (!all(cellsMetadata$NAME == colnames(rawData))) {
+    stop("Error: problem with cells metadata")
+  }
+  seurat.BC <- CreateSeuratObject(
+    counts = rawData, 
+    meta.data = cellsMetadata,
+    names.delim = "-",
+    project = "BreastCancer_NatGen_2021"
+  )  %>% NormalizeData(
+    normalization.method = "LogNormalize", verbose = TRUE
+  )
+  saveRDS(
+    seurat.BC, file.path(objectsPath, paste(prefix, "seurat.BC.rds", sep = "."))
+  )
+}
+
+```
+# Normalization and scaling
+
+```{r}
+seurat.BC <- FindVariableFeatures(
+  seurat.BC, selection.method = "vst"
+)
+## visualization
+top10 <- head(VariableFeatures(seurat.BC))
+varGenes <- VariableFeatures(seurat.BC)
+# plot variable features with and without labels
+plot <- VariableFeaturePlot(seurat.BC)
+LabelPoints(
+  plot = plot, points = top10, 
+  repel = TRUE, xnudge = 0, ynudge = 0
+)
+```
+
+
+```{r}
+if (file.exists(file.path(objectsPath, paste(prefix, "seurat.BC.scal.rds", sep = ".")))) {
+  seurat.BC <- readRDS(
+    file = file.path(
+      objectsPath, paste(prefix, "seurat.BC.scal.rds", sep = ".")
+    )
+  )
+} else {
+  seurat.BC <- ScaleData(
+    object = seurat.BC, 
+    do.scale = TRUE,
+    do.center = TRUE,
+    features = varGenes,
+    display.progress = TRUE
+  ) %>% RunPCA(
+    features = varGenes,
+    ndims.print = 1:5,
+    nfeatures.print = 30,
+    npcs = 100
+  )
+  saveRDS(
+    seurat.BC, 
+    file = file.path(objectsPath, paste(prefix, "seurat.BC.scal.rds", sep = "."))
+  )
+}
+```
+
+```{r, eval = FALSE}
+list.seurat.BCs <- SplitObject(seurat.BC, split.by = "ident")
+```
+
+Taken from (<https://github.com/Swarbricklab-code/BrCa_cell_atlas/blob/main/seurat_data_integration/config/scripts/seurat_CCA_HPC_processing.R>).
+
+```{r, eval = FALSE}
+num_cc_to_compute <- 30
+num_genes_for_int_CCA <- 2000
+integrate_all_genes_by_intersect <- FALSE
+number_of_PCs_to_compute <- 100
+run_parallel <- TRUE
+number_of_objects <- length(list.seurat.BCs)
+```
+
+
+```{r, eval = FALSE}
+# Find integration anchors
+if (run_parallel) {
+  plan("multiprocess", workers = temp_run_parallel_cores)
+  options(future.globals.maxSize = 10 * 1024^3)
+}
+
+temp_anchor_start <- Sys.time()
+seuratAnchors <- FindIntegrationAnchors(
+  object.list = list.seurat.BCs, 
+  dims = 1:num_cc_to_compute,
+  anchor.features = num_genes_for_int_CCA
+)
+temp_anchor_finish <- Sys.time()
+
+# intersection
+if (integrate_all_genes_by_intersect) {
+  for (i in c(1:length(temp_sample_list))) {
+    temp_genes <- rownames(temp_sample_list[[i]])
+    n <- paste0("temp_genes_sample_", i)
+    assign(n, temp_genes)
+  }
+  temp_genes_list <- mget(ls(pattern = "temp_genes_sample_*"))
+  temp_genes_interesect <- Reduce(intersect, temp_genes_list)
+} else {
+  temp_integration_start <- Sys.time()
+  seurat.BC.int <- IntegrateData(
+    anchorset = seuratAnchors, 
+    dims = 1:temp_num_cc_compute
+  )
+  temp_integration_finish <- Sys.time()
+}
+ 
+DefaultAssay(object = seurat.BC.int) <- "integrated"
+
+# scale data
+seurat.BC.int <- ScaleData(
+  object = seurat.BC.int, verbose = TRUE
+)
+
+# PCA
+seurat.BC.int <- RunPCA(
+  object = seurat.BC.int, npcs = number_of_PCs_to_compute, 
+  verbose = TRUE
+)
+
+```
+
+# Load object
+
+```{r}
+#Inspired from last comment on https://github.com/satijalab/seurat/issues/1883
+seurat.BC <- readRDS(file.path(objectsPath, paste(prefix, "seurat.BC.int.rds", sep = ".")))
+  
+#Compile clusters for Diego: 
+seurat.BC@meta.data <- mutate(
+  seurat.BC@meta.data,
+  celltype_custom = case_when(
+    celltype_subset %in% c("T_cells_c2_CD4+_T-regs_FOXP3") ~ "CD4 Tregs",
+    celltype_subset %in% c("T_cells_c3_CD4+_Tfh_CXCL13", "T_cells_c0_CD4+_CCR7", "T_cells_c1_CD4+_IL7R") ~ "CD4 TCs",
+    celltype_subset %in% c("T_cells_c4_CD8+_ZFP36", "T_cells_c5_CD8+_GZMK", "T_cells_c7_CD8+_IFNG", "T_cells_c8_CD8+_LAG3") ~ "CD8 TCs",
+    celltype_subset %in% c("T_cells_c9_NK_cells_AREG", "T_cells_c10_NKT_cells_FCGR3A") ~ "NK",
+    celltype_subset %in% c("Myeloid_c1_LAM1_FABP5", "Myeloid_c10_Macrophage_1_EGR1", "Myeloid_c2_LAM2_APOE", "Myeloid_c9_Macrophage_2_CXCL10") ~ "MFs",
+    celltype_subset %in% c("Myeloid_c7_Monocyte_3_FCGR3A", "Myeloid_c8_Monocyte_2_S100A9", "Myeloid_c2_LAM2_APOE", "Myeloid_c12_Monocyte_1_IL1B") ~ "Monocytes",
+    celltype_subset %in% c("Myeloid_c3_cDC1_CLEC9A") ~ "cDC1",
+    celltype_subset %in% c("Myeloid_c11_cDC2_CD1C") ~ "cDC2",
+    celltype_subset %in% c("Myeloid_c4_DCs_pDC_IRF7") ~ "pDC",
+    celltype_subset %in% c("Myeloid_c0_DC_LAMP3") ~ "mregDC",
+    .default = celltype_major
+  )
+)
+```
+
+```{r}
+#Subset
+DefaultAssay(seurat.BC) <- "RNA"
+CD4 <- seurat.BC$celltype_minor == "T cells CD4+"
+seurat.BC <- seurat.BC[, CD4]
+
+#Integrate, scale and Findvariablegenes
+seurat.BC <- SplitObject(seurat.BC, split.by = "Patient")
+seurat.BC <- lapply(seurat.BC, SCTransform)
+
+#Deleted all sample with less than 100 CD4 cells
+seurat.BC$CID4523 <- NULL
+seurat.BC$CID3946 <- NULL
+seurat.BC$CID4461 <- NULL
+seurat.BC$CID4465 <- NULL
+
+#Integrate data
+features  <- SelectIntegrationFeatures(seurat.BC, nfeatures = 3000)
+seurat.BC <- PrepSCTIntegration(seurat.BC, anchor.features = features)
+anchors <- FindIntegrationAnchors(seurat.BC, normalization.method = "SCT", anchor.features = features)
+seurat.BC.combined <- IntegrateData(anchorset = anchors, normalization.method = "SCT", k.weight = 46)
+
+#Run PCA
+seurat.BC.combined <- RunPCA(seurat.BC.combined)
+
+pcas <- 20
+ElbowPlot(seurat.BC.combined, ndims = 50) + theme_linedraw() +
+  geom_vline(xintercept = pcas, color = "red", size = 0.5) +
+  ggtitle("Elbow plot of first 50 PCs")
+
+#Represent UMAP
+ seurat.BC.combined <- RunUMAP(
+   seurat.BC.combined, dims = seq(pcas), verbose = TRUE
+ )
+  DimPlot(
+  seurat.BC.combined, group.by = "Patient", reduction = "umap", cols = color.list(), 
+  raster = TRUE
+)
+  
+  DimPlot(
+  seurat.BC.combined, group.by = "celltype_subset", reduction = "umap", cols = color.list(), 
+  raster = TRUE
+)  
+  
+FeaturePlot(
+  object = seurat.BC.combined, 
+  reduction = "umap",
+  features = "CXCR6",
+  pt.size = 1,
+  min.cutoff = 0,
+  cols = c("lightgrey", "peru", "orangered4"), 
+  order = T
+  )
+
+FeaturePlot(
+  object = seurat.BC.combined, 
+  reduction = "umap",
+  features = "CCR7",
+  pt.size = 0.35,
+  min.cutoff = 0,
+  cols = c("lightgrey", "peru", "orangered4"), 
+  order = T
+  )
+```
+
+##Find clusters
+```{r}
+ress <- c( 1)
+kList <- c(80)
+ress <- c(0.8, 1, 1.2, 1.5)
+kList <- c(20, 50, 80)
+for (k in kList) {
+  seurat.BC.combined <- FindNeighbors(
+    seurat.BC.combined, 
+    reduction = "pca", 
+    dims = 1:pcas, 
+    # features = useGenes, 
+    compute.SNN = TRUE, 
+    k.param = k, 
+    # return.neighbor = TRUE,
+    nn.method = "annoy", 
+    n.trees = 80,
+    graph.name = paste("k", k, sep = "."),
+    # do.plot = T
+  )  
+  cat(paste(">>> With k =", k, "\n"))
+  for (res in ress) {
+    if (res %in% colnames(seurat.BC.combined@meta.data)) {
+      cat("Resolution already done\n")
+      cat(
+        paste(
+          "res:", res, "Number of clusters detected:", 
+          length(
+            levels(factor(seurat.BC.combined@meta.data[, paste("res", res, sep=".")]))
+          ), "\n"
+        )
+      )
+    } else {
+      seurat.BC.combined <- FindClusters(
+        seurat.BC.combined, 
+        temp.file.location = objectsPath, 
+        algorithm = 2, 
+        n.iter = 20,
+        resolution = res, 
+        verbose = FALSE, 
+        random.seed = 123456,
+        graph.name = paste("k", k, sep = ".")
+      )
+      cat(
+        paste(
+          "   res:", res, "Number of clusters detected:", 
+          length(
+            levels(factor(seurat.BC.combined@meta.data[, paste0("k.", k, "_res.", res)]))
+          ), "\n"
+        )
+      )
+    }
+  }
+}
+
+#Plot clusters: 80 0.8 and 80 0.5 
+for (k in kList) {
+  for (res in ress) {
+    p3 <- DimPlot(
+      seurat.BC.combined, 
+      group.by = paste0("k.", k, "_res.", res), 
+      reduction = "umap",
+      cols = color.list()
+    ) + ggtitle(paste0("umap(", paste0("k.", k, "_res.", res), ")"))
+    print(ggarrange(plotlist = list(p3)))
+  }
+}
+```
+
+##Define resolution
+
+```{r}
+#Define new cluster as res.Final.1
+seurat.BC.combined$res.Final.1 <- factor(
+  paste0("C", seurat.BC.combined$k.50_res.1.5), 
+  levels = paste0("C", seq(0,  length(unique(seurat.BC.combined$k.50_res.1.5))))
+)
+
+Idents(seurat.BC.combined) <- seurat.BC.combined$res.Final.1
+
+#Define original clusters + new cluster C16 as res.Final.2
+seurat.BC.combined$res.Final.2 <- ifelse(seurat.BC.combined$res.Final.1 == "C16", "CD4+ Trm", seurat.BC.combined$celltype_subset )
+
+#Order clusters for plotting
+seurat.BC.combined@active.ident <- factor(seurat.BC.combined@active.ident, 
+                            levels=c('CD4+ Trm',
+                                  'T_cells_c3_CD4+_Tfh_CXCL13',
+                                  'T_cells_c0_CD4+_CCR7',
+                                  'T_cells_c1_CD4+_IL7R',
+                                  'T_cells_c2_CD4+_T-regs_FOXP3'))
+
+```
+
+##Define colors
+
+```{r}
+colorsPlots <- list(
+  Original_clusters = c(
+    "T_cells_c1_CD4+_IL7R" = color.list()[3],
+    "T_cells_c0_CD4+_CCR7" = color.list()[12],
+    "T_cells_c2_CD4+_T-regs_FOXP3" = color.list()[8], 
+    "T_cells_c3_CD4+_Tfh_CXCL13" = color.list()[13]
+  ),
+  New_clusters = c(
+    "CD4+ Trm" = color.list()[6],
+    "T_cells_c1_CD4+_IL7R" = color.list()[3],
+    "T_cells_c0_CD4+_CCR7" = color.list()[12],
+    "T_cells_c2_CD4+_T-regs_FOXP3" = color.list()[8], 
+    "T_cells_c3_CD4+_Tfh_CXCL13" = color.list()[13]
+  ), 
+  Sub_clusters = c(
+    "C0" = color.list()[2],
+    "C1" = color.list()[3],
+    "C2" = color.list()[4],
+    "C3" = color.list()[5],
+    "C4" = color.list()[1],
+    "C5" = color.list()[7],
+    "C6" = color.list()[8],
+    "C7" = color.list()[9],
+    "C8" = color.list()[10],
+    "C9" = color.list()[11],
+    "C10" = color.list()[12],
+    "C11" = color.list()[13],
+    "C12" = color.list()[14],
+    "C13" = color.list()[15],
+    "C14" = color.list()[16],
+    "C15" = color.list()[17],
+    "C16" = color.list()[6],
+    "C17" = color.list()[18]
+  )
+)
+```
+
+##Make plots
+
+```{r}
+DimPlot(
+  seurat.BC.combined, reduction = "umap", group.by = "celltype_subset", 
+  cols = colorsPlots$Original_clusters
+) + ggtitle("Original identification")
+
+DimPlot(
+  seurat.BC.combined, reduction = "umap", group.by = "res.Final.1", 
+  cols = colorsPlots$Sub_clusters, pt.size = 1
+) + ggtitle("New identification")
+```
+
+## CD4 Trm (Human from Savas et al and cluster 0 from our data) of each cluster of CD4 T cells
+
+```{r}
+#Checked here how can one avoid the missing genes errors https://github.com/satijalab/seurat/issues/4881
+seurat.BC.combined <- AddModuleScore(
+  seurat.BC.combined, features = geneSignaturesF, name = "modules",
+  ctrl = 50, assay = "SCT"
+)
+tmp <- tail(seq_len(ncol(seurat.BC.combined@meta.data)), length(geneSignaturesF))
+newColumns <- seurat.BC.combined@meta.data[, tmp]
+colnames(newColumns) <- names(geneSignaturesF)
+seurat.BC.combined@meta.data <- cbind(seurat.BC.combined@meta.data, newColumns)
+seurat.BC.combined@meta.data[, tmp] <- NULL
+```
+
+## Heatmap modulescores on all subclusters
+```{r, fig.height=15, fig.width=20}
+#In order to represent the values of module score per each of the sublcusters, we will represent the average in a heatmap. 
+scoreexp <- data.frame(seurat.BC.combined@meta.data$res.Final.1)
+scoreexp <- cbind("seurat_cluster" = scoreexp, "Mouse_CD4_Trm" = seurat.BC.combined$Costum_C0_up, "Human_CD4_Trm"= seurat.BC.combined$CD4_Trm_Signature)
+names(scoreexp)[names(scoreexp) == 'seurat.BC.combined.meta.data.res.Final.1'] <- 'seurat_cluster'
+
+scoreexp <-scoreexp %>% group_by(seurat_cluster) %>% summarise_all(mean)
+scoreexp <- as.data.frame(scoreexp)
+row.names(scoreexp) <- scoreexp$seurat_cluster
+scoreexp$seurat_cluster <- NULL
+scoreexp <- as.matrix(scoreexp)
+scoreexp <- t(scoreexp)
+
+col_fun = colorRamp2(c(-2, 0, 2.5), c("#5c8f9c", "white", "#654321"))
+
+#We scale the matrix to plot Z-scores
+"lightgrey", "peru", "orangered4"
+scaled_score = t(scale(t(scoreexp)))
+
+#PLot
+ComplexHeatmap::Heatmap(
+  scaled_score, 
+  col = col_fun,
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10), name = "Scaled mean module score",
+  column_title_gp = gpar(fontface = "bold", fontsize = 15), 
+  column_title = "Expression of CD4Trm signatures",
+  column_order = NULL,
+  row_order = NULL,
+  column_names_rot = 45,
+  cluster_columns = FALSE,
+  show_row_dend = FALSE,
+  row_dend_reorder = FALSE,
+  row_title = NULL,
+  row_names_side = "left",
+  border = TRUE,
+  width = unit(7, "cm"), height = unit(1, "cm"),
+  heatmap_legend_param = list(
+    legend_height = unit(2, "cm"),
+    title_gp = gpar(fontsize = 10)
+  )
+)
+
+dev.off()
+```
+
+## Correlation cDC1 signature 
+
+### Find frequency of new clusters in every patient
+```{r, fig.width=6, fig.height=3.5}
+dfProp_c <- seurat.BC.combined@meta.data %>%
+  group_by(Patient, res.Final.2) %>%
+  summarise(n = n()) %>%
+  mutate(freq = (n / sum(n) * 100)) %>%
+  ungroup() %>%
+  complete(Patient, res.Final.2, fill = list(n = 0, freq = 0)) 
+
+dfProp_c <- as.data.frame(dfProp_c)
+```
+
+### Get frequency of each predefined cluster per patient. 
+```{r, fig.width=6, fig.height=3.5}
+#Get frequencies from defined clusters within TCs. 
+#Workaround to get those clusters that have 0 cells in the specific patient inspired from https://kieranhealy.org/blog/archives/2018/11/19/zero-counts-in-dplyr/
+
+#CD4 T cell freq in tumor
+dfProp_min <- as.data.frame(dfProp_min)
+Tcprop <- dfProp_min[dfProp_min$celltype_minor == "T cells CD4+",]
+rownames(Tcprop) <- Tcprop$Patient 
+Tcprop$Patient <- NULL
+Tcprop$celltype_minor <- NULL
+Tcprop$n <- NULL
+names(Tcprop) <- "CD4"
+CD4_001 <- Tcprop
+
+#cDC1 prop
+dfProp_sub <- as.data.frame(dfProp_sub)
+cDC1prop <- dfProp_sub[dfProp_sub$celltype_subset == "Myeloid_c3_cDC1_CLEC9A",]
+rownames(cDC1prop) <- cDC1prop$Patient 
+cDC1prop$Patient <- NULL
+cDC1prop$celltype_subset <- NULL
+cDC1prop$n <- NULL
+names(cDC1prop) <- "cDC1prop"
+
+#cDC2 prop
+dfProp_sub <- as.data.frame(dfProp_sub)
+cDC2prop <- dfProp_sub[dfProp_sub$celltype_subset == "Myeloid_c11_cDC2_CD1C",]
+rownames(cDC2prop) <- cDC2prop$Patient 
+cDC2prop$Patient <- NULL
+cDC2prop$celltype_subset <- NULL
+cDC2prop$n <- NULL
+names(cDC2prop) <- "cDC2prop"
+
+
+#Normalize to obtain % of each res.Final.2 cluster within tumor
+dfProp_c$n <- NULL
+dfProp_c_wide <- pivot_wider(dfProp_c, names_from = "res.Final.2", values_from = "freq")
+dfProp_c_wide <- as.data.frame(dfProp_c_wide)
+rownames(dfProp_c_wide) <- dfProp_c_wide$Patient
+dfProp_c_wide$Patient <- NULL
+
+cluster_intumor <- merge(dfProp_c_wide, CD4_001, by=0)
+rownames(cluster_intumor) <- cluster_intumor$Row.names
+cluster_intumor$`CD4+ Trm` <- cluster_intumor$`CD4+ Trm` * cluster_intumor$CD4* 0.01
+cluster_intumor$`T_cells_c3_CD4+_Tfh_CXCL13` <- cluster_intumor$`T_cells_c3_CD4+_Tfh_CXCL13` * cluster_intumor$CD4* 0.01
+cluster_intumor$`T_cells_c0_CD4+_CCR7` <- cluster_intumor$`T_cells_c0_CD4+_CCR7` * cluster_intumor$CD4* 0.01
+cluster_intumor$`T_cells_c1_CD4+_IL7R` <- cluster_intumor$`T_cells_c1_CD4+_IL7R` * cluster_intumor$CD4* 0.01
+cluster_intumor$`T_cells_c2_CD4+_T-regs_FOXP3` <- cluster_intumor$`T_cells_c2_CD4+_T-regs_FOXP3` * cluster_intumor$CD4* 0.01
+
+rownames(cluster_intumor) <- cluster_intumor$Row.names 
+cluster_intumor$Row.names <- NULL
+
+cluster_intumor <- merge(cluster_intumor, cDC1prop, by=0 )
+rownames(cluster_intumor) <- cluster_intumor$Row.names 
+cluster_intumor$Row.names <- NULL
+
+cluster_intumor <- merge(cluster_intumor, cDC2prop, by=0 )
+rownames(cluster_intumor) <- cluster_intumor$Row.names 
+cluster_intumor$Row.names <- NULL
+```
+
+
+### Merge and find correlation of scRNAseq
+```{r, fig.width=6, fig.height=3.5}
+# Create dataframe where to save results
+res <- data.frame(matrix(nrow = 0, ncol = 4))
+colnames(res) <- c("var1", "var2", "correlation", "pvalue")
+
+# Correlation in loop
+for(i in colnames(cluster_intumor[,1:6])) {
+  for(j in c("cDC1prop", "cDC2prop")) {
+    a <- cor.test(cluster_intumor[[i]], cluster_intumor[[j]], method = "spearman")
+    res <- rbind(res, data.frame(
+      "var1" = i,
+      "var2" = j,
+      "correlation" = a$estimate,
+      "pvalue" = a$p.value))
+  }
+}
+
+# Remove rownames
+rownames(res) <- NULL
+
+res <- cbind(res,log10(res$pvalue))
+res<- cbind(res, res$`log10(res$pvalue)`*-1)
+colnames(res)[5]<- "mistake"
+colnames(res)[6]<- "-log10padj.value"
+```
+
+
+### Visualization of correlation scRNAseq
+```{r fig.height=13}
+# Visual representation of correlation
+p1<- ggscatter(
+  cluster_intumor, x= "cDC1prop", 
+  y = "CD4+ Trm",
+  color = "black", 
+  size = 1,
+  #rug = TRUE,
+  #fill = "Tissue",
+  add = "reg.line", conf.int = TRUE, 
+  #palette = color.list(),
+  cor.coef = TRUE, cor.method = "spearman", 
+  title = "Correlation cDC1"
+) + #geom_smooth(method = "lm", colour = mycol, se = FALSE) + 
+  theme_classic2() + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+```
+
+
+

@@ -1,6 +1,8 @@
-# Code associated with the study _Immunotherapy with natural conventional type-1 dendritic cells excels at immune memory induction to eradicate cancer relapse_
+# Code associated with the study _Immunotherapy with conventional type-1 dendritic cells induces memory and limits tumor relapse_
 
-The repository contains one directory, related to the analysis of the scRNAseq data. Raw data for this analysis is deposited under the accession number GSE249585
+The repository contains four scripts, related to the analysis of main figures 6 and 7 and supplementary figures 6 and 7 of the manuscript. 
+
+The scRNAseq data generated in this study have been deposited in GEO under the accession code GSE249585. The scRNAseq data of human BRCA patients are available in the GEO database under the accession code GSE176078. TCGA gene expression data for skin cutaneous melanoma (SKCM) and breast carcinoma (BRCA) are avail- able in the Broad Institute Firehose portal (https://gdac.broadinstitute. org/) and summarized pan-cancer clinical data are available in the synapse database under the accession code syn12026747.
 
 ## Disclaimer
     
